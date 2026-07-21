@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import yaml
 
@@ -52,6 +52,7 @@ class SkillUseRail(DeepAgentRail):
         disabled_skills: Optional[Union[str, List[str]]] = None,
         evolution_store: Optional[EvolutionStore] = None,
         multimodal_skill_mode: str = "hint",
+        skill_selector: Optional[Callable[[Sequence[Skill], AgentCallbackContext], Sequence[Skill]]] = None,
     ):
         """Initialize SkillUseRail.
 
@@ -67,6 +68,8 @@ class SkillUseRail(DeepAgentRail):
             disabled_skills: Optional deny-list of skill names. Supports str or List[str].
             evolution_store: Optional EvolutionStore for progressive disclosure experience text.
             multimodal_skill_mode: ``hint`` (default), ``attach``, or ``branch``.
+            skill_selector: Optional per-model-call visibility filter. Its result
+                controls prompt and tool exposure instead of the session baseline.
         """
         super().__init__()
 
@@ -85,8 +88,10 @@ class SkillUseRail(DeepAgentRail):
         self.disabled_skills = self._normalize_name_set(disabled_skills)
         self.evolution_store: Optional[EvolutionStore] = evolution_store
         self.multimodal_skill_mode = multimodal_skill_mode
+        self.skill_selector = skill_selector
 
         self.skills: List[Skill] = []
+        self._selected_skills: List[Skill] = []
         self.system_prompt_builder = None
         self.attachment_manager = None
 
@@ -122,6 +127,7 @@ class SkillUseRail(DeepAgentRail):
         self._skill_update_at.clear()
         self._skill_order.clear()
         self.skills = []
+        self._selected_skills = []
         self._skills_snapshot_signature = None
 
     async def _prepare_skills(self) -> None:
@@ -133,6 +139,7 @@ class SkillUseRail(DeepAgentRail):
 
         await self._refresh_skills_incrementally()
         self.skills = self._filter_skills(self._collect_skills_in_order())
+        self._selected_skills = []
 
     async def _refresh_skills_incrementally(self) -> None:
         """Refresh skills by loading only new or updated SKILL.md files."""
@@ -420,12 +427,17 @@ class SkillUseRail(DeepAgentRail):
             else list(self.skills)
         )
         await self._fetch_evolution_texts([*baseline_skills, *self.skills])
-        skills_section = self._build_skills_section(baseline_skills)
+        if self.skill_selector is not None:
+            self._selected_skills = list(self.skill_selector(self.skills, ctx))
+            prompt_skills = self._selected_skills
+        else:
+            prompt_skills = baseline_skills
+        skills_section = self._build_skills_section(prompt_skills)
         if skills_section is not None:
             self.system_prompt_builder.add_section(skills_section)
         else:
             self.system_prompt_builder.remove_section(SectionName.SKILLS)
-        await self._update_runtime_skill_attachment(ctx, baseline_skills)
+        await self._update_runtime_skill_attachment(ctx, prompt_skills)
 
     async def _refresh_skill_prompt_if_changed(self, ctx: AgentCallbackContext) -> None:
         """Refresh skills when visible skill directories or SKILL.md mtimes changed."""
@@ -486,10 +498,12 @@ class SkillUseRail(DeepAgentRail):
     def get_skills_for_session(self, session: Any = None) -> List[Skill]:
         """Return the current skill view for a tool invocation.
 
-        The persisted baseline is included even if the directory was changed after
-        the session started. Newly discovered skills remain available as runtime
-        additions for the current session.
+        A configured selector controls the current view. Otherwise, the persisted
+        baseline is combined with skills discovered later in the session.
         """
+        if self.skill_selector is not None:
+            return list(self._selected_skills)
+
         baseline = self._load_session_baseline(session)
         if self._load_session_state(session) is None:
             return list(self.skills)
@@ -570,9 +584,10 @@ class SkillUseRail(DeepAgentRail):
         manager = self.attachment_manager
         if manager is None:
             return
+        current_skills = self._selected_skills if self.skill_selector is not None else self.skills
         baseline_by_name = {skill.name: skill for skill in baseline_skills}
-        current_by_name = {skill.name: skill for skill in self.skills}
-        additions = [skill for skill in self.skills if skill.name not in baseline_by_name]
+        current_by_name = {skill.name: skill for skill in current_skills}
+        additions = [skill for skill in current_skills if skill.name not in baseline_by_name]
         removals = [skill for skill in baseline_skills if skill.name not in current_by_name]
         writer = manager.bind_context(ctx)
         if not writer.session_id:
@@ -738,7 +753,11 @@ class SkillUseRail(DeepAgentRail):
         yaml_data, _ = await self._load_yaml(path)
         if yaml_data is None or "description" not in yaml_data:
             raise KeyError("SKILL.md file does not contain a description field")
-        return str(yaml_data["description"])
+        description = str(yaml_data["description"])
+        when_to_use = str(yaml_data.get("when_to_use", "")).strip()
+        if when_to_use:
+            description = f"{description}\n  when_to_use: {when_to_use}"
+        return description
 
     @staticmethod
     def _skill_md_path(skill: Skill) -> Path:

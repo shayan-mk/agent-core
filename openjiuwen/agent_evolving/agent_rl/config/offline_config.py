@@ -7,7 +7,10 @@ Pydantic configuration schemas for RL training.
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import build_error
 
 
 class PersistenceConfig(BaseModel):
@@ -126,6 +129,22 @@ class AdaConfig(BaseModel):
     final_keep_per_prompt: int = 8
 
 
+class SkillRLConfig(BaseModel):
+    """Opt-in skill-bank mounting and co-evolution for offline GRPO."""
+
+    bank_root: str
+    workspace: str
+    success_threshold: float = 1.0
+    evolution_interval: int = Field(default=5, gt=0)
+    min_observations_per_arm: int = Field(default=25, gt=0)
+    memory: Optional[float] = Field(default=None, gt=0)
+    reservoir_capacity: int = Field(default=200, gt=0)
+    exploration_floor: float = Field(default=0.15, ge=0.0, lt=0.5)
+    retrieval_top_k: Optional[int] = Field(default=None, gt=0)
+    triggered_loading: bool = True
+    seed: Optional[int] = None
+
+
 class RLConfig(BaseModel):
     """Top level RL configuration."""
 
@@ -133,10 +152,33 @@ class RLConfig(BaseModel):
     rollout: RolloutConfig = Field(default_factory=RolloutConfig)
     runtime: AgentRuntimeConfig = Field(default_factory=AgentRuntimeConfig)
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
+    skill_rl: Optional[SkillRLConfig] = None
     ada: Optional[AdaConfig] = Field(
         default=None,
         description="If provided, enable Ada rollout variant. Omit to use default rollout.",
     )
+
+    @model_validator(mode="after")
+    def _check_skill_rl_requirements(self) -> "RLConfig":
+        """skill_rl co-evolution requires within-group GRPO over full trajectories."""
+        if self.skill_rl is None:
+            return self
+        if self.training.algorithm_adv_estimator.lower() != "grpo":
+            raise build_error(
+                StatusCode.TOOLCHAIN_EVOLVING_SKILL_BANK_PARAM_ERROR,
+                error_msg="skill_rl requires algorithm_adv_estimator='grpo'",
+            )
+        if not self.training.whole_trajectory:
+            raise build_error(
+                StatusCode.TOOLCHAIN_EVOLVING_SKILL_BANK_PARAM_ERROR,
+                error_msg="skill_rl requires training.whole_trajectory=True",
+            )
+        if self.rollout.rollout_n < 2:
+            raise build_error(
+                StatusCode.TOOLCHAIN_EVOLVING_SKILL_BANK_PARAM_ERROR,
+                error_msg="skill_rl requires rollout.rollout_n >= 2",
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------

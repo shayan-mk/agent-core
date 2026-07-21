@@ -4,12 +4,12 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, List, Optional, Dict
+from typing import Any, Callable, List, Optional, Dict, Sequence
 from os import PathLike
 
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import build_error
 from openjiuwen.core.common.logging import logger
 from openjiuwen.core.foundation.llm.model import Model
 from openjiuwen.core.foundation.tool import Tool, ToolCard, McpServerConfig
@@ -40,26 +40,11 @@ from openjiuwen.harness.schema.config import (
 from openjiuwen.harness.workspace.workspace import Workspace
 from openjiuwen.harness.prompts import resolve_language
 from openjiuwen.harness.prompts.tools.task_tool import GENERAL_PURPOSE_AGENT_DESC
+from openjiuwen.harness.skill_sources import (
+    collect_disabled_skills_from_state,
+    resolve_skill_roots,
+)
 from openjiuwen.harness.tools import create_vision_tools, is_free_search_enabled
-
-
-def _collect_disabled_skills_from_state(skills_dirs: list[str]) -> list[str]:
-    """Read skills_state.json from each skills_dir and collect disabled skill names."""
-    disabled: set[str] = set()
-    for skills_dir in skills_dirs:
-        state_path = Path(skills_dir) / "skills_state.json"
-        if not state_path.is_file():
-            continue
-        try:
-            data = json.loads(state_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            logger.warning("Failed to read skills_state.json at %s", state_path)
-            continue
-        skill_configs = data.get("skill_configs", {})
-        for name, cfg in skill_configs.items():
-            if isinstance(cfg, dict) and cfg.get("enabled") is False:
-                disabled.add(name)
-    return sorted(disabled)
 
 
 def _is_disabled_free_search_tool(tool: Tool | ToolCard) -> bool:
@@ -176,6 +161,8 @@ def resolve_deep_agent_parts(
     max_iterations: int = 15,
     workspace: Optional[str | Workspace] = None,
     skills: Optional[List[str]] = None,
+    skill_roots: Optional[Sequence[str | PathLike]] = None,
+    skill_selector: Optional[Callable] = None,
     backend: Optional[Any] = None,
     sys_operation: Optional[SysOperation] = None,
     language: Optional[str] = None,
@@ -246,6 +233,12 @@ def resolve_deep_agent_parts(
     else:
         workspace_obj = workspace
 
+    if skill_roots is not None and not isinstance(sys_operation, SysOperation):
+        raise build_error(
+            StatusCode.DEEPAGENT_CONFIG_PARAM_ERROR,
+            error_msg="explicit skill_roots require a caller-owned SysOperation",
+        )
+
     if not isinstance(sys_operation, SysOperation):
         sysop_id = f"{card.name}_{card.id}"
         # Get-or-create: the id is stable across rebuilds (a member harness is
@@ -311,18 +304,8 @@ def resolve_deep_agent_parts(
         return any(issubclass(t, rail_cls) for t in user_provided_rail_types)
 
     def _make_skill_rail() -> SkillUseRail:
-        skills_dirs: list[str] = []
-        skills_base = workspace_obj.get_node_path("skills")
-        if skills_base:
-            skills_dirs.append(str(skills_base))
-        # Aggregate skills from each team workspace mounted under
-        # ``.team/{team_id}``; the team mount is a symlink to the shared
-        # workspace root, so the team-shared skills live at
-        # ``{target}/skills``. Paths are added even when they do not yet
-        # exist — SkillUseRail skips missing directories at refresh time.
-        for _team_id, target_path in workspace_obj.list_team_links():
-            skills_dirs.append(str(Path(target_path) / "skills"))
-        disabled_skills = _collect_disabled_skills_from_state(skills_dirs)
+        resolved_skill_roots = resolve_skill_roots(workspace_obj, skill_roots)
+        disabled_skills = collect_disabled_skills_from_state(resolved_skill_roots)
         # ``include_tools`` registers read_file / code / bash so skills can do
         # file/shell ops. When a SysOperationRail is already mounted it owns
         # those tools (and refresh-binds them to the live sys_operation), so
@@ -332,10 +315,12 @@ def resolve_deep_agent_parts(
         # when no fs rail provides them.
         include_tools = not _already_provided(SysOperationRail)
         return SkillUseRail(
-            skills_dir=skills_dirs,
+            skills_dir=resolved_skill_roots,
             skill_mode="all",
+            enabled_skills=skills if skill_roots is not None else None,
             disabled_skills=disabled_skills or None,
             include_tools=include_tools,
+            skill_selector=skill_selector,
         )
 
     def _make_task_planning_rail() -> TaskPlanningRail:
@@ -345,7 +330,7 @@ def resolve_deep_agent_parts(
         (SecurityRail, True, lambda: SecurityRail()),
         (LLMRetryRail, enable_llm_retry_rail, lambda: LLMRetryRail()),
         (TaskPlanningRail, enable_task_planning, _make_task_planning_rail),
-        (SkillUseRail, bool(skills) or config.enable_skill_discovery, _make_skill_rail),
+        (SkillUseRail, bool(skills or skill_roots) or config.enable_skill_discovery, _make_skill_rail),
         (SubagentRail, bool(effective_subagents),
          lambda: SubagentRail(enable_async_subagent=enable_async_subagent)),
         (ToolCallResilienceRail, config.enable_tool_resilience_rail, lambda: ToolCallResilienceRail()),

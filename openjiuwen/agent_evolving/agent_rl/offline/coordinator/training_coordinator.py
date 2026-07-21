@@ -69,6 +69,7 @@ class TrainingCoordinator:
 
         self._persistence = persistence
         self._current_step = 0
+        self._skill_bank_cycle = None
         self._final_keep_per_prompt = config.get(
             "JiuwenRL", {}
         ).get("final_keep_per_prompt")
@@ -131,6 +132,7 @@ class TrainingCoordinator:
         batch_size = len(next(iter(rl_data.values())))
         self.clear_up_data()
         tasks_dic: Dict[str, RLTask] = {}
+        version_id = self._skill_bank_cycle.baseline.version_id if self._skill_bank_cycle else None
 
         for i in range(batch_size):
             task = {key: rl_data[key][i] for key in rl_data}
@@ -140,6 +142,12 @@ class TrainingCoordinator:
                 origin_task_id=task_id,
                 task_sample=task,
                 round_num=0,
+                skill_bank_version=version_id,
+                skill_bank_task_key=(
+                    self._skill_bank_cycle.task_key(task)
+                    if self._skill_bank_cycle is not None
+                    else None
+                ),
             )
 
         try:
@@ -258,6 +266,10 @@ class TrainingCoordinator:
         if reward_fn is not None:
             self.parallel_executor.set_reward_fn(reward_fn)
 
+    def configure_skill_bank(self, cycle):
+        """Attach the optional skill-bank adoption cycle."""
+        self._skill_bank_cycle = cycle
+
     async def _initialize_parallel_processing(self):
         """Initialize and start parallel processing."""
         self._setup_parallel_executor()
@@ -279,14 +291,24 @@ class TrainingCoordinator:
         for i in range(batch_size):
             task_id = str(uuid.uuid4())
             rollout_n = self.config["actor_rollout_ref"]["rollout"]["n"]
+            task_sample = {key: rl_data[key][i] for key in rl_data}
+            skill_bank_task_key = (
+                self._skill_bank_cycle.task_key(task_sample)
+                if self._skill_bank_cycle is not None
+                else None
+            )
             for _ in range(rollout_n):
                 rollout_n_id = str(uuid.uuid4())
-                task_sample = {key: rl_data[key][i] for key in rl_data}
+                skill_bank_version = None
+                if self._skill_bank_cycle is not None:
+                    skill_bank_version = self._skill_bank_cycle.assign()
                 tasks_dic[rollout_n_id] = RLTask(
                     task_id=rollout_n_id,
                     origin_task_id=task_id,
                     task_sample=task_sample,
                     round_num=0,
+                    skill_bank_version=skill_bank_version,
+                    skill_bank_task_key=skill_bank_task_key,
                 )
         return tasks_dic
 
@@ -362,6 +384,8 @@ class TrainingCoordinator:
         collected_mdp: Dict[str, list] = {}
 
         for _, rollout_msg in collected_data.items():
+            if self._skill_bank_cycle is not None:
+                self._skill_bank_cycle.observe(rollout_msg)
             if len(rollout_msg.rollout_info):
                 self._turn_counts.append(len(rollout_msg.rollout_info))
                 if rollout_msg.reward_list:

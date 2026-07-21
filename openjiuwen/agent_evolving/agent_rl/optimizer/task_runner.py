@@ -182,6 +182,8 @@ class OfflineTaskRunner(BaseTaskRunner):
         reward_fn=None,
         metrics_tracker=None,
         persistence=None,
+        skill_bank_config=None,
+        skill_creator=None,
     ):
         from openjiuwen.agent_evolving.agent_rl.offline.main_trainer import MainTrainer
 
@@ -218,6 +220,25 @@ class OfflineTaskRunner(BaseTaskRunner):
         self.verl_trainer = VerlTrainingExecutor(**trainer_kwargs)
         self.verl_trainer.init_workers()
 
+        skill_bank_cycle = None
+        if skill_bank_config is not None:
+            from openjiuwen.agent_evolving.skill_bank import (
+                SkillBankAdoptionCycle,
+                SkillBankStore,
+            )
+
+            store = SkillBankStore(skill_bank_config.bank_root)
+            skill_bank_cycle = SkillBankAdoptionCycle(
+                store,
+                success_threshold=skill_bank_config.success_threshold,
+                steps_per_cycle=skill_bank_config.evolution_interval,
+                min_observations_per_arm=skill_bank_config.min_observations_per_arm,
+                memory=skill_bank_config.memory,
+                reservoir_capacity=skill_bank_config.reservoir_capacity,
+                candidate_creator=skill_creator,
+                exploration_floor=skill_bank_config.exploration_floor,
+                seed=skill_bank_config.seed,
+            )
         self.main_trainer = MainTrainer(
             rl_trainer=self.verl_trainer,
             config=config,
@@ -228,6 +249,7 @@ class OfflineTaskRunner(BaseTaskRunner):
             reward_fn=reward_fn,
             metrics_tracker=metrics_tracker,
             persistence=persistence,
+            skill_bank_cycle=skill_bank_cycle,
         )
 
         self.tokenizer = tokenizer

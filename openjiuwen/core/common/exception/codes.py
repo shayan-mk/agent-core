@@ -795,6 +795,18 @@ class StatusCode(Enum):
     TOOLCHAIN_EVOLVING_SKILL_STORE_EXECUTION_ERROR = (
         174038, "toolchain evolving skill store execution error, reason: {error_msg}"
     )
+    TOOLCHAIN_EVOLVING_SKILL_BANK_PARAM_ERROR = (
+        174039, "toolchain evolving skill bank parameter error, reason: {error_msg}"
+    )
+    TOOLCHAIN_EVOLVING_SKILL_BANK_NOT_FOUND = (
+        174040, "toolchain evolving skill bank not found, reason: {error_msg}"
+    )
+    TOOLCHAIN_EVOLVING_SKILL_BANK_EXECUTION_ERROR = (
+        174041, "toolchain evolving skill bank execution error, reason: {error_msg}"
+    )
+    TOOLCHAIN_EVOLVING_SKILL_BANK_INTEGRITY_INVALID = (
+        174042, "toolchain evolving skill bank integrity invalid, reason: {error_msg}"
+    )
 
     # =========================
     # Foundation 180000 – 189999

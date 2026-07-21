@@ -65,12 +65,14 @@ class MainTrainer:
         reward_fn=None,
         metrics_tracker: Optional[RLMetricsTracker] = None,
         persistence: Optional[RolloutPersistence] = None,
+        skill_bank_cycle=None,
     ):
         self.rl_trainer = rl_trainer
         self.config = config
         self._metrics_tracker = metrics_tracker
         self._persistence = persistence
         self._agent_factory = agent_factory
+        self._skill_bank_cycle = skill_bank_cycle
 
         self.train_dataset = rl_trainer.train_dataset
         self.val_dataset = rl_trainer.val_dataset
@@ -84,6 +86,9 @@ class MainTrainer:
             task_data_fn=task_data_fn,
             reward_fn=reward_fn,
         )
+
+        if skill_bank_cycle is not None:
+            self.training_coordinator.configure_skill_bank(skill_bank_cycle)
 
         # -- BackendProxy (auto-assigned free port) -------------------------
         self._proxy = BackendProxy(
@@ -273,6 +278,15 @@ class MainTrainer:
 
                     metrics = self.rl_trainer.train_step(origin_batch, batch)
 
+                    skill_cycle_record = None
+                    if self._skill_bank_cycle is not None:
+                        skill_cycle_record = self._skill_bank_cycle.on_train_step(
+                            self.rl_trainer.global_steps,
+                            before_decision=self.rl_trainer.save_checkpoint,
+                        )
+                    if skill_cycle_record is not None:
+                        metrics.update(skill_cycle_record.as_metrics())
+
                     # Validation
                     test_freq = self.config.trainer.get("test_freq", 0)
                     if test_freq > 0 and (
@@ -421,6 +435,8 @@ class MainTrainer:
                         return
 
                 except (IndexError, ValueError) as e:
+                    if self._skill_bank_cycle is not None:
+                        self._skill_bank_cycle.discard_pending_step()
                     logger.warning(
                         "Empty or invalid batch at step %d, skipping this step: %s\n%s",
                         self.rl_trainer.global_steps,
@@ -429,6 +445,8 @@ class MainTrainer:
                     )
 
                 except Exception as e:
+                    if self._skill_bank_cycle is not None:
+                        self._skill_bank_cycle.discard_pending_step()
                     logger.error(
                         "Unexpected exception, save checkpoint and exit: %s", e
                     )

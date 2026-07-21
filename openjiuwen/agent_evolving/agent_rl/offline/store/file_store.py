@@ -126,6 +126,10 @@ class FileRolloutStore(RolloutPersistence):
             "end_time": rollout.end_time,
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         }
+        if rollout.skill_bank_version is not None:
+            doc["skill_bank_version"] = rollout.skill_bank_version
+        if rollout.skill_bank_task_key is not None:
+            doc["skill_bank_task_key"] = rollout.skill_bank_task_key
         rollout_dir = self._rollout_dir_for_phase(phase)
         try:
             self._append_jsonl(self._file_for_step(rollout_dir, step), doc)

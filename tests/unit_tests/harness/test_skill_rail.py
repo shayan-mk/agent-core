@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import pytest
@@ -83,14 +84,18 @@ def _write_skill(
     name: str,
     description: str,
     body: str = "",
+    *,
+    when_to_use: str | None = None,
 ) -> Path:
     """Create a minimal skill directory with SKILL.md."""
     skill_dir = root / name
     skill_dir.mkdir(parents=True, exist_ok=True)
     skill_md = skill_dir / "SKILL.md"
+    when_to_use_line = f"when_to_use: {when_to_use}\n" if when_to_use else ""
     skill_md.write_text(
         "---\n"
         f"description: {description}\n"
+        f"{when_to_use_line}"
         "---\n\n"
         f"# {name}\n{body}",
         encoding="utf-8",
@@ -210,6 +215,52 @@ async def test_skill_rail_all_mode_injects_skill_prompt(tmp_path: Path):
     assert "Parse invoice pdf files" in content
     assert "Write xlsx reports" in content
     assert "list_skill" not in content
+
+
+@pytest.mark.asyncio
+async def test_skill_selector_controls_current_session_view(tmp_path: Path):
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir(parents=True, exist_ok=True)
+    _write_skill(
+        skills_root,
+        "invoice-parser",
+        "Parse invoice pdf files",
+        when_to_use="When the task contains an invoice PDF",
+    )
+    _write_skill(skills_root, "xlsx-writer", "Write xlsx reports")
+
+    selected = {"invoice-parser"}
+    rail = SkillUseRail(
+        skills_dir=str(skills_root),
+        skill_mode="all",
+        include_tools=False,
+        skill_selector=lambda skills, _ctx: [skill for skill in skills if skill.name in selected],
+    )
+
+    async def read_file(path: str, **_kwargs):
+        return SimpleNamespace(
+            code=0,
+            data=SimpleNamespace(content=Path(path).read_text(encoding="utf-8")),
+        )
+
+    rail.set_sys_operation(SimpleNamespace(fs=lambda: SimpleNamespace(read_file=read_file)))
+    rail.system_prompt_builder = SystemPromptBuilder()
+    session = _SessionState("selected-skills")
+    ctx = AgentCallbackContext(agent=None, inputs=ModelCallInputs(tools=[]), session=session)
+
+    await rail.before_invoke(ctx)
+    await rail.before_model_call(ctx)
+    assert _sorted_skill_names(rail.get_skills_for_session(session)) == ["invoice-parser"]
+    prompt = rail.system_prompt_builder.build()
+    assert "invoice-parser" in prompt and "xlsx-writer" not in prompt
+    assert "When the task contains an invoice PDF" in prompt
+
+    selected.clear()
+    selected.add("xlsx-writer")
+    await rail.before_model_call(ctx)
+    assert _sorted_skill_names(rail.get_skills_for_session(session)) == ["xlsx-writer"]
+    prompt = rail.system_prompt_builder.build()
+    assert "invoice-parser" not in prompt and "xlsx-writer" in prompt
 
 
 @pytest.mark.asyncio

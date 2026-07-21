@@ -6,6 +6,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import build_error
 from openjiuwen.core.common.logging import logger
 from openjiuwen.agent_evolving.agent_rl.config.offline_config import RLConfig
 
@@ -87,6 +89,7 @@ class OfflineRLOptimizer(BaseRLOptimizer):
         self._reward_fn = None
         self._tools = []
         self._tool_names = []
+        self._skill_creator = None
 
     def set_tools(self, tools: list) -> None:
         self._tools = tools
@@ -111,18 +114,53 @@ class OfflineRLOptimizer(BaseRLOptimizer):
     def set_agent_factory(self, factory: Callable) -> None:
         self._agent_factory = factory
 
+    def set_skill_creator(
+        self,
+        llm,
+        model: str,
+        *,
+        language: str = "cn",
+        max_task_groups: int = 6,
+        minimum_trigger_fire_rate: float = 0.5,
+    ) -> None:
+        """Configure agent-core's history-informed ReSkill creator."""
+        if self.config.skill_rl is None:
+            raise build_error(
+                StatusCode.TOOLCHAIN_EVOLVING_SKILL_BANK_PARAM_ERROR,
+                error_msg="set_skill_creator requires an enabled skill_rl configuration",
+            )
+        from openjiuwen.agent_evolving.skill_bank import SkillBankCreatorPipeline
+
+        self._skill_creator = SkillBankCreatorPipeline(
+            self.config.skill_rl.bank_root,
+            llm,
+            model,
+            language=language,
+            max_task_groups=max_task_groups,
+            minimum_trigger_fire_rate=minimum_trigger_fire_rate,
+        )
+
     def _get_rollout_reward_fn(self):
         return getattr(self, "_reward_fn", None)
 
     def _resolve_agent_factory(self):
+        skill_cfg = self.config.skill_rl
         if self._agent_factory is not None:
+            if skill_cfg is not None:
+                raise build_error(
+                    StatusCode.TOOLCHAIN_EVOLVING_SKILL_BANK_PARAM_ERROR,
+                    error_msg="skill_rl requires the built-in version-aware agent factory",
+                )
             return self._agent_factory
-        if self._tools:
+        if self._tools or skill_cfg is not None:
             from openjiuwen.agent_evolving.agent_rl.offline.runtime.agent_factory import (
                 build_agent_factory,
             )
             return build_agent_factory(
-                self.config.runtime, self._tools, self._tool_names
+                self.config.runtime,
+                self._tools,
+                self._tool_names,
+                skill_bank_config=skill_cfg,
             )
         return None
 
@@ -236,6 +274,11 @@ class OfflineRLOptimizer(BaseRLOptimizer):
         return OmegaConf.merge(base_cfg, dynamic)
 
     def init_trainer(self) -> None:
+        if self.config.skill_rl is not None and self._skill_creator is None:
+            raise build_error(
+                StatusCode.TOOLCHAIN_EVOLVING_SKILL_BANK_PARAM_ERROR,
+                error_msg="skill_rl requires set_skill_creator() before training",
+            )
         import ray_adapter as ray
         from openjiuwen.agent_evolving.agent_rl.optimizer.task_runner import OfflineTaskRunner
 
@@ -258,14 +301,14 @@ class OfflineRLOptimizer(BaseRLOptimizer):
                 reward_fn=self._get_rollout_reward_fn(),
                 metrics_tracker=metrics_tracker,
                 persistence=persistence,
+                skill_bank_config=self.config.skill_rl,
+                skill_creator=self._skill_creator,
             )
         )
         logger.info("Offline trainer initialized successfully")
 
     def start_training(self) -> None:
         import ray_adapter as ray
-        from openjiuwen.core.common.exception.codes import StatusCode
-        from openjiuwen.core.common.exception.errors import build_error
 
         if self._runner is None:
             try:

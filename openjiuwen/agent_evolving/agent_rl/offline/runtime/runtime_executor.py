@@ -14,8 +14,10 @@ Designed to be called repeatedly from ParallelRuntimeExecutor worker loops.
 """
 
 import inspect
+import shutil
 import traceback
 import uuid
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -73,6 +75,8 @@ class RuntimeExecutor:
             global_reward=0.0,
             turn_count=0,
             round_num=rollout_task.round_num,
+            skill_bank_version=rollout_task.skill_bank_version,
+            skill_bank_task_key=rollout_task.skill_bank_task_key,
         )
 
         try:
@@ -109,42 +113,70 @@ class RuntimeExecutor:
         """Run agent with TrajectoryCollector (RAIL mode) and build RolloutMessage."""
         from openjiuwen.agent_evolving.agent_rl.offline.runtime.collector import TrajectoryCollector
 
-        if inspect.iscoroutinefunction(self._agent_factory):
-            agent = await self._agent_factory(rl_task)
-        else:
-            agent = self._agent_factory(rl_task)
+        agent = self._agent_factory(rl_task)
+        if inspect.isawaitable(agent):
+            agent = await agent
 
-        inputs = self._build_agent_inputs(rl_task)
-        collector = TrajectoryCollector()
-        trajectory = await collector.collect(
-            agent, inputs,
-            session_id=rl_task.task_id,
-            source="offline",
-            case_id=rl_task.origin_task_id,
-        )
-        rollouts: List[Rollout] = trajectory_to_rollouts(trajectory)
+        try:
+            inputs = self._build_agent_inputs(rl_task)
+            collector = TrajectoryCollector()
+            trajectory = await collector.collect(
+                agent,
+                inputs,
+                session_id=rl_task.task_id,
+                source="offline",
+                case_id=rl_task.origin_task_id,
+            )
+            rollouts: List[Rollout] = trajectory_to_rollouts(trajectory)
 
-        now = datetime.utcnow().isoformat()
-        msg = RolloutMessage(
-            task_id=rl_task.task_id,
-            origin_task_id=rl_task.origin_task_id,
-            rollout_id=f"rollout-{rl_task.task_id}",
-            start_time=now,
-            end_time=now,
-            rollout_info=rollouts,
-            reward_list=[],
-            global_reward=None,
-            turn_count=len(rollouts),
-            round_num=rl_task.round_num,
-        )
+            now = datetime.utcnow().isoformat()
+            msg = RolloutMessage(
+                task_id=rl_task.task_id,
+                origin_task_id=rl_task.origin_task_id,
+                rollout_id=f"rollout-{rl_task.task_id}",
+                start_time=now,
+                end_time=now,
+                rollout_info=rollouts,
+                reward_list=[],
+                global_reward=None,
+                turn_count=len(rollouts),
+                round_num=rl_task.round_num,
+                skill_bank_version=rl_task.skill_bank_version,
+                skill_bank_task_key=rl_task.skill_bank_task_key,
+            )
 
-        ground_truth = inputs.get("ground_truth", "")
-        if ground_truth and msg.rollout_info:
-            if msg.rollout_info[0].input_prompt is None:
-                msg.rollout_info[0].input_prompt = {}
-            msg.rollout_info[0].input_prompt["ground_truth"] = ground_truth
+            ground_truth = inputs.get("ground_truth", "")
+            if ground_truth and msg.rollout_info:
+                if msg.rollout_info[0].input_prompt is None:
+                    msg.rollout_info[0].input_prompt = {}
+                msg.rollout_info[0].input_prompt["ground_truth"] = ground_truth
 
-        return msg
+            return msg
+        finally:
+            await self._teardown_agent(agent)
+
+    async def _teardown_agent(self, agent: Any) -> None:
+        """Retire rollout-local rails and agent-owned tools."""
+        if getattr(agent, "_runtime_owned_agent", False) is not True:
+            return
+
+        for rail in list(agent.configured_rails()):
+            with suppress(Exception):
+                await agent.unregister_rail(rail)
+        with suppress(Exception):
+            agent.ability_manager.teardown_tools()
+
+        config = getattr(agent, "_deep_config", None)
+        operation = getattr(config, "sys_operation", None)
+        if operation is not None:
+            from openjiuwen.core.runner import Runner
+
+            with suppress(Exception):
+                Runner.resource_mgr.remove_sys_operation(operation.id, tag=agent.card.id)
+
+        owned_workspace = getattr(agent, "_runtime_owned_workspace", None)
+        if owned_workspace:
+            shutil.rmtree(owned_workspace, ignore_errors=True)
 
     def _build_agent_inputs(self, rl_task: RLTask) -> Dict[str, Any]:
         """Build agent inputs from the task sample."""

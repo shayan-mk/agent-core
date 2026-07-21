@@ -64,6 +64,8 @@ class RolloutMessage(BaseModel):
     global_reward: Optional[float] = None
     turn_count: int = 0
     round_num: Optional[int] = None
+    skill_bank_version: Optional[str] = None
+    skill_bank_task_key: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +80,8 @@ class RLTask(BaseModel):
     origin_task_id: str
     task_sample: Dict[str, Any] = {}
     round_num: int = 0
+    skill_bank_version: Optional[str] = None
+    skill_bank_task_key: Optional[str] = None
 
 
 class RolloutWithReward(BaseModel):

@@ -34,6 +34,8 @@ def _make_rollout_msg(task_id="t1", origin_task_id="o1", reward=1.0):
 @pytest.mark.asyncio
 async def test_save_train_rollout_creates_jsonl(store, tmp_path):
     msg = _make_rollout_msg()
+    msg.skill_bank_version = "bank_000001"
+    msg.skill_bank_task_key = "task-key"
     await store.save_rollout(step=0, task_id="t1", rollout=msg, phase="train")
 
     fpath = tmp_path / "train" / "rollouts" / "steps_000000_000099.jsonl"
@@ -43,6 +45,8 @@ async def test_save_train_rollout_creates_jsonl(store, tmp_path):
     doc = json.loads(lines[0])
     assert doc["task_id"] == "t1"
     assert doc["global_reward"] == 1.0
+    assert doc["skill_bank_version"] == "bank_000001"
+    assert doc["skill_bank_task_key"] == "task-key"
 
 
 @pytest.mark.asyncio
