@@ -17,7 +17,7 @@ from typing import Optional
 from openjiuwen.core.single_agent.rail.base import (
     AgentCallbackContext,
 )
-from openjiuwen.harness.rails import EvolutionRail
+from openjiuwen.harness.rails import ACTIVE_SKILLS_EXTRA_KEY, EvolutionRail
 
 
 class RLRail(EvolutionRail):
@@ -82,6 +82,9 @@ class RLRail(EvolutionRail):
                     "source": self._source,
                     "case_id": self._case_id,
                 })
+                active_skills = ctx.extra.get(ACTIVE_SKILLS_EXTRA_KEY)
+                if isinstance(active_skills, list):
+                    last_step.meta["active_skills"] = [str(name) for name in active_skills]
 
 
 __all__ = ["RLRail"]

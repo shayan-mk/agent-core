@@ -9,6 +9,7 @@ from openjiuwen.agent_evolving.agent_rl.offline.runtime.collector import (
     TrajectoryCollector,
 )
 from openjiuwen.agent_evolving.agent_rl.rl_rail import RLRail
+from openjiuwen.harness.rails import ACTIVE_SKILLS_EXTRA_KEY
 from openjiuwen.agent_evolving.agent_rl.schemas import trajectory_to_rollouts
 from openjiuwen.agent_evolving.trajectory import (
     InMemoryTrajectoryStore,
@@ -26,6 +27,7 @@ def _ctx(inputs) -> MagicMock:
     ctx = MagicMock(spec=AgentCallbackContext)
     ctx.inputs = inputs
     ctx.agent = None
+    ctx.extra = {}
     return ctx
 
 
@@ -54,7 +56,9 @@ async def test_rl_rail_uses_evolution_rail_flow():
         tools=[{"name": "test_tool", "description": "test tool"}],
         response=mock_response,
     )
-    await rail.after_model_call(_ctx(after))
+    after_ctx = _ctx(after)
+    after_ctx.extra = {ACTIVE_SKILLS_EXTRA_KEY: ["test-skill"]}
+    await rail.after_model_call(after_ctx)
 
     await rail.after_invoke(_ctx(invoke_inputs))
 
@@ -64,6 +68,7 @@ async def test_rl_rail_uses_evolution_rail_flow():
     step0 = trajectory_steps(trajectories[0])[0]
     assert step0.meta.get("turn_id") == 0
     assert step0.meta.get("case_id") == "case-123"
+    assert step0.meta.get("active_skills") == ["test-skill"]
 
 
 @pytest.mark.asyncio

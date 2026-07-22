@@ -56,7 +56,11 @@ def _message(version_id: str | None, reward: float | None, *, turns: int = 1) ->
         origin_task_id="origin-1",
         rollout_id="rollout-1",
         rollout_info=[
-            Rollout(turn_id=i, output_response={"content": "final answer"})
+            Rollout(
+                turn_id=i,
+                output_response={"content": "final answer"},
+                active_skills=["calculator"],
+            )
             for i in range(turns)
         ],
         global_reward=reward,
@@ -158,7 +162,7 @@ def test_adoption_cycle_accepts_better_candidate_and_promotes(tmp_path: Path) ->
     cycle = SkillBankAdoptionCycle(
         store,
         steps_per_cycle=2,
-        min_observations_per_arm=2,
+        min_version_episodes=4,
         candidate_creator=lambda _parent, _entries: None,
         seed=1,
     )
@@ -168,6 +172,7 @@ def test_adoption_cycle_accepts_better_candidate_and_promotes(tmp_path: Path) ->
     cycle.observe(_message(candidate_id, 1.0))
     assert cycle.on_train_step(step=1) is None
     assert cycle.reservoir.entries()[0].payload["turns"][0]["response"] == "final answer"
+    assert cycle.reservoir.entries()[0].payload["turns"][0]["active_skills"] == ["calculator"]
     assert store.get_proposal(proposal_id).status is ProposalStatus.PENDING
 
     cycle.observe(_message(baseline_id, 0.0))
@@ -191,7 +196,7 @@ def test_adoption_cycle_skips_incomparable_and_rejects_worse_candidate(tmp_path:
     store, baseline_id, candidate_id, proposal_id = _store_with_trial(tmp_path)
     cycle = SkillBankAdoptionCycle(
         store,
-        min_observations_per_arm=2,
+        min_version_episodes=4,
         candidate_creator=lambda _parent, _entries: None,
         seed=1,
     )

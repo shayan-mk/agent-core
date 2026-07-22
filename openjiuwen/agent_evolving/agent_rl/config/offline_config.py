@@ -134,12 +134,14 @@ class SkillRLConfig(BaseModel):
 
     bank_root: str
     workspace: str
+    max_bank_skills: int = Field(default=8, gt=0)
     success_threshold: float = 1.0
     evolution_interval: int = Field(default=5, gt=0)
-    min_observations_per_arm: int = Field(default=25, gt=0)
+    min_version_episodes: int = Field(default=50, gt=0)
+    min_reservoir_size: int = Field(default=100, gt=0)
     memory: Optional[float] = Field(default=None, gt=0)
     reservoir_capacity: int = Field(default=200, gt=0)
-    exploration_floor: float = Field(default=0.15, ge=0.0, lt=0.5)
+    exploration_floor: float = Field(default=0.15, gt=0.0, lt=0.5)
     retrieval_top_k: Optional[int] = Field(default=None, gt=0)
     triggered_loading: bool = True
     seed: Optional[int] = None
@@ -177,6 +179,11 @@ class RLConfig(BaseModel):
             raise build_error(
                 StatusCode.TOOLCHAIN_EVOLVING_SKILL_BANK_PARAM_ERROR,
                 error_msg="skill_rl requires rollout.rollout_n >= 2",
+            )
+        if self.skill_rl.min_reservoir_size > self.skill_rl.reservoir_capacity:
+            raise build_error(
+                StatusCode.TOOLCHAIN_EVOLVING_SKILL_BANK_PARAM_ERROR,
+                error_msg="skill_rl min_reservoir_size cannot exceed reservoir_capacity",
             )
         return self
 

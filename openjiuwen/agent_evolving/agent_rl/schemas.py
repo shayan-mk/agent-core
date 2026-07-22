@@ -45,6 +45,7 @@ class Rollout(BaseModel):
     output_response_ids: Optional[List[int]] = None
     """Completion token IDs returned by the LLM service.
     None when token IDs were not requested or not available."""
+    active_skills: Optional[List[str]] = None
 
 
 class RolloutMessage(BaseModel):
@@ -205,8 +206,12 @@ def trajectory_to_rollouts(trajectory: Trajectory) -> List[Rollout]:
             "tools": tools_norm,
         }
         llm_config = None
+        active_skills: Optional[List[str]] = None
         if hasattr(step, "meta") and step.meta:
             llm_config = step.meta.get("llm_config")
+            raw_active_skills = step.meta.get("active_skills")
+            if isinstance(raw_active_skills, list):
+                active_skills = [str(name) for name in raw_active_skills]
 
         prompt_ids: Optional[List[int]] = getattr(step, "prompt_token_ids", None)
         completion_ids: Optional[List[int]] = getattr(step, "completion_token_ids", None)
@@ -218,6 +223,7 @@ def trajectory_to_rollouts(trajectory: Trajectory) -> List[Rollout]:
             llm_config=llm_config,
             input_prompt_ids=prompt_ids or None,
             output_response_ids=completion_ids or None,
+            active_skills=active_skills,
         ))
 
     return rollouts

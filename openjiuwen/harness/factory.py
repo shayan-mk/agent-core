@@ -163,6 +163,7 @@ def resolve_deep_agent_parts(
     skills: Optional[List[str]] = None,
     skill_roots: Optional[Sequence[str | PathLike]] = None,
     skill_selector: Optional[Callable] = None,
+    inline_selected_skills: bool = False,
     backend: Optional[Any] = None,
     sys_operation: Optional[SysOperation] = None,
     language: Optional[str] = None,
@@ -321,6 +322,7 @@ def resolve_deep_agent_parts(
             disabled_skills=disabled_skills or None,
             include_tools=include_tools,
             skill_selector=skill_selector,
+            inline_selected_skills=inline_selected_skills,
         )
 
     def _make_task_planning_rail() -> TaskPlanningRail:

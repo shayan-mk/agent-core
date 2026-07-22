@@ -94,7 +94,10 @@ def test_trajectory_to_rollouts_projects_otlp_token_tools_and_meta_fields():
                 ),
                 prompt_token_ids=[101, 102, 103],
                 completion_token_ids=[201, 202],
-                meta={"llm_config": {"temperature": 0.2}},
+                meta={
+                    "llm_config": {"temperature": 0.2},
+                    "active_skills": ["search"],
+                },
             ),
         ],
         source="rl_offline",
@@ -116,3 +119,4 @@ def test_trajectory_to_rollouts_projects_otlp_token_tools_and_meta_fields():
     assert rollout.input_prompt_ids == [101, 102, 103]
     assert rollout.output_response_ids == [201, 202]
     assert rollout.llm_config == {"temperature": 0.2}
+    assert rollout.active_skills == ["search"]

@@ -83,15 +83,12 @@ def infer_skill_from_texts(
 
 def parse_top_level_frontmatter(content: str) -> dict[str, str]:
     """Parse only top-level scalar fields from Markdown frontmatter."""
-    text = content.strip()
-    if not text.startswith("---"):
-        return {}
-    end = text.find("---", 3)
-    if end == -1:
+    frontmatter_text, _ = _split_frontmatter(content)
+    if frontmatter_text is None:
         return {}
 
     frontmatter: dict[str, str] = {}
-    for line in text[3:end].strip().split("\n"):
+    for line in frontmatter_text.splitlines():
         if not line or line[0].isspace() or line.startswith("-"):
             continue
         if ":" not in line:
@@ -99,6 +96,23 @@ def parse_top_level_frontmatter(content: str) -> dict[str, str]:
         key, _, value = line.partition(":")
         frontmatter[key.strip()] = value.strip()
     return frontmatter
+
+
+def frontmatter_body(content: str) -> str:
+    """Return the Markdown body that follows top-level frontmatter."""
+    _, body = _split_frontmatter(content)
+    return body
+
+
+def _split_frontmatter(content: str) -> tuple[str | None, str]:
+    text = content.strip()
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None, text
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            return "\n".join(lines[1:index]), "\n".join(lines[index + 1:]).strip()
+    return None, ""
 
 
 def _extract_skill_tool_name(payload: Any) -> str:

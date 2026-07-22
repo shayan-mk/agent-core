@@ -184,6 +184,7 @@ class AgentFactory:
                     skills=skill_names,
                     skill_roots=skill_roots,
                     skill_selector=self._build_skill_selector(),
+                    inline_selected_skills=self._skill_bank_config.triggered_loading,
                     sys_operation=operation,
                     restrict_to_work_dir=True,
                 )

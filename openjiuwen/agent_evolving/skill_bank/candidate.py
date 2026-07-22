@@ -33,10 +33,12 @@ from openjiuwen.agent_evolving.skill_bank.source import (
 from openjiuwen.agent_evolving.skill_bank.store import SkillBankStore
 from openjiuwen.agent_evolving.skill_bank.templates import SKILL_BANK_CREATOR_PROMPT
 from openjiuwen.agent_evolving.skill_bank.triggers import validate_skill_trigger
-from openjiuwen.agent_evolving.utils import TuneUtils
+from openjiuwen.agent_evolving.utils import TuneUtils, frontmatter_body
 from openjiuwen.core.common.exception.errors import BaseError
 from openjiuwen.core.common.logging import logger
 from openjiuwen.core.foundation.llm.model import Model
+from openjiuwen.harness.prompts.sections.skills import MAX_INLINE_SKILL_GUIDANCE_CHARS
+
 
 @dataclass(frozen=True)
 class CandidateBuildResult:
@@ -49,8 +51,11 @@ class CandidateBuildResult:
 class SkillBankCandidateBuilder:
     """Apply bank operations only inside a writable parent-version copy."""
 
-    def __init__(self, store: SkillBankStore) -> None:
+    def __init__(self, store: SkillBankStore, *, max_bank_skills: int = 8) -> None:
+        if max_bank_skills <= 0:
+            raise _param("max bank skills must be positive")
         self._store = store
+        self.max_bank_skills = max_bank_skills
 
     def build(
         self,
@@ -60,19 +65,20 @@ class SkillBankCandidateBuilder:
         if proposal.candidate_version_id is not None:
             raise _param("proposal already has a candidate version")
         self._validate_operations(proposal.operations)
-        self._store.record_proposal(proposal)
         parent = self._store.resolve(proposal.parent_version_id, verify=True)
+        expected = self._expected_skills(parent, proposal.operations)
+        if len(expected) > self.max_bank_skills:
+            raise _param(
+                f"candidate has {len(expected)} skills; maximum is {self.max_bank_skills}"
+            )
+        self._store.record_proposal(proposal)
 
         with tempfile.TemporaryDirectory(prefix="openjiuwen-skill-candidate-") as temporary:
             candidate_root = Path(temporary) / "skills"
             shutil.copytree(parent.skills_dir, candidate_root, copy_function=shutil.copy2)
             _make_writable(candidate_root)
             self._apply_package_operations(candidate_root, proposal.operations)
-            self._validate_final_skills(
-                parent,
-                candidate_root,
-                proposal.operations,
-            )
+            self._validate_final_skills(expected, candidate_root)
             sources = self._build_candidate_provenance(parent, candidate_root, proposal)
             candidate = self._store.create_snapshot(
                 candidate_root,
@@ -125,18 +131,21 @@ class SkillBankCandidateBuilder:
             _remove_deleted_state(root, deleted)
 
     @staticmethod
-    def _validate_final_skills(
+    def _expected_skills(
         parent: BankVersionRef,
-        candidate_root: Path,
         operations: Sequence[SkillOperation],
-    ) -> None:
+    ) -> set[str]:
+        """Return the skill names the candidate must end up with."""
         expected = set(parent.manifest.skill_names)
         for operation in operations:
             if operation.action is SkillOperationType.ADD:
                 expected.add(operation.skill_name)
             elif operation.action is SkillOperationType.DELETE:
                 expected.discard(operation.skill_name)
+        return expected
 
+    @staticmethod
+    def _validate_final_skills(expected: set[str], candidate_root: Path) -> None:
         actual = {package.name for package in candidate_root.iterdir() if is_skill_package(package)}
         if actual != expected:
             raise _param("candidate skill set does not match the proposal operations")
@@ -210,6 +219,7 @@ class SkillBankPackageCreator:
         *,
         language: str = "cn",
         minimum_trigger_fire_rate: float = 0.5,
+        action_vocabulary: Sequence[str] = (),
     ) -> None:
         if language not in SKILL_BANK_CREATOR_PROMPT:
             raise _param(f"unsupported creator language: {language}")
@@ -220,6 +230,7 @@ class SkillBankPackageCreator:
         self._model = model
         self._language = language
         self._minimum_trigger_fire_rate = minimum_trigger_fire_rate
+        self._action_vocabulary = tuple(dict.fromkeys(str(name) for name in action_vocabulary if name))
 
     async def create(
         self,
@@ -233,21 +244,29 @@ class SkillBankPackageCreator:
     ) -> CandidateBuildResult | None:
         """Propose and build one candidate from reservoir evidence, or skip."""
         evidence = [entry for entry in entries if entry.payload is not None]
-        if all(entry.success for entry in evidence):
+        if not evidence:
             return None
 
+        # Only trigger_feedback changes between authoring attempts.
+        prompt_args = {
+            "bank_version": parent.version_id,
+            "bank_size": len(parent.manifest.skill_names),
+            "max_bank_skills": self._builder.max_bank_skills,
+            "action_vocabulary": self._format_action_vocabulary(evidence),
+            "current_skills": self.format_current_skills(parent),
+            "analysis": json.dumps(analysis or {}, ensure_ascii=False, indent=2),
+            "proposal_history": self._format_proposal_history(proposal_history),
+            "successes": self._format_examples(evidence, success=True),
+            "failures": self._format_examples(evidence, success=False),
+            "max_operations": _MAX_CREATOR_OPERATIONS,
+            "max_inline_chars": MAX_INLINE_SKILL_GUIDANCE_CHARS,
+        }
         trigger_feedback = "(none)"
         parsed = None
         for attempt in range(_MAX_AUTHORING_ATTEMPTS):
             prompt = SKILL_BANK_CREATOR_PROMPT[self._language].format(
-                bank_version=parent.version_id,
-                current_skills=self.format_current_skills(parent),
-                analysis=json.dumps(analysis or {}, ensure_ascii=False, indent=2),
-                proposal_history=self._format_proposal_history(proposal_history),
-                successes=self._format_examples(evidence, success=True),
-                failures=self._format_examples(evidence, success=False),
+                **prompt_args,
                 trigger_feedback=trigger_feedback,
-                max_operations=_MAX_CREATOR_OPERATIONS,
             )
             raw = await invoke_text_with_retry(self._llm, self._model, prompt, policy=_CREATOR_LLM_POLICY)
             parsed = _parse_creator_response(raw)
@@ -260,7 +279,11 @@ class SkillBankPackageCreator:
             trigger_feedback = self._validate_triggers(raw_operations, evidence) or ""
             if not trigger_feedback:
                 break
-            logger.info("Skill-bank authoring attempt %d failed trigger validation: %s", attempt + 1, trigger_feedback)
+            logger.info(
+                "Skill-bank authoring attempt %d failed trigger validation: %s",
+                attempt + 1,
+                trigger_feedback,
+            )
         if trigger_feedback:
             return None
         assertion, raw_operations = parsed
@@ -294,15 +317,24 @@ class SkillBankPackageCreator:
             skill_md = operation.get("skill_md")
             if not isinstance(skill_md, str):
                 continue
-            try:
-                issue = validate_skill_trigger(
-                    str(operation.get("skill_name", "")),
-                    skill_md,
-                    evidence,
-                    minimum_fire_rate=self._minimum_trigger_fire_rate,
+            body = frontmatter_body(skill_md)
+            if not body:
+                issue = "inline SKILL.md guidance must not be empty"
+            elif len(body) > MAX_INLINE_SKILL_GUIDANCE_CHARS:
+                issue = (
+                    f"inline SKILL.md guidance has {len(body)} characters; "
+                    f"maximum is {MAX_INLINE_SKILL_GUIDANCE_CHARS}; move detail to support files"
                 )
-            except BaseError as exc:
-                issue = str(exc)
+            else:
+                try:
+                    issue = validate_skill_trigger(
+                        str(operation.get("skill_name", "")),
+                        skill_md,
+                        evidence,
+                        minimum_fire_rate=self._minimum_trigger_fire_rate,
+                    )
+                except BaseError as exc:
+                    issue = str(exc)
             if issue:
                 feedback.append(issue)
         return "; ".join(feedback) or None
@@ -362,6 +394,23 @@ class SkillBankPackageCreator:
             ensure_ascii=False,
             indent=2,
         )
+
+    def _format_action_vocabulary(self, evidence: Sequence[ReservoirEntry]) -> str:
+        names = set(self._action_vocabulary)
+        for entry in evidence:
+            for turn in (entry.payload or {}).get("turns", []):
+                action = turn.get("action") if isinstance(turn, dict) else None
+                if not isinstance(action, list):
+                    continue
+                for call in action:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function")
+                    source = function if isinstance(function, dict) else call
+                    name = source.get("name")
+                    if name:
+                        names.add(str(name))
+        return json.dumps(sorted(names), ensure_ascii=False)
 
     def _to_operation(
         self,

@@ -55,6 +55,11 @@ def _compact_trajectory(message: RolloutMessage) -> dict:
                     if isinstance(response, dict)
                     else response
                 ),
+                "active_skills": (
+                    list(rollout.active_skills)
+                    if rollout.active_skills is not None
+                    else None
+                ),
             }
         )
     return {"turns": turns}
@@ -164,8 +169,8 @@ class ThompsonAllocation:
         *,
         floor: float = 0.15,
     ):
-        if not 0.0 <= floor < 0.5:
-            raise _param("exploration floor must be in [0, 0.5)")
+        if not 0.0 < floor < 0.5:
+            raise _param("exploration floor must be in (0, 0.5)")
         self._baseline_arm = baseline_arm
         self._candidate_arm = candidate_arm
         self._floor = floor
@@ -195,7 +200,8 @@ class SkillBankAdoptionCycle:
         *,
         success_threshold: float = 1.0,
         steps_per_cycle: int = 1,
-        min_observations_per_arm: int = 1,
+        min_version_episodes: int = 50,
+        min_reservoir_size: int = 100,
         memory: float | None = None,
         reservoir_capacity: int = 200,
         candidate_creator: CandidateCreator,
@@ -204,12 +210,15 @@ class SkillBankAdoptionCycle:
     ) -> None:
         if steps_per_cycle <= 0:
             raise _param("steps_per_cycle must be positive")
-        if min_observations_per_arm <= 0:
-            raise _param("min_observations_per_arm must be positive")
+        if min_version_episodes <= 0:
+            raise _param("min_version_episodes must be positive")
+        if min_reservoir_size <= 0:
+            raise _param("min_reservoir_size must be positive")
         self._store = store
         self._success_threshold = float(success_threshold)
         self._steps_per_cycle = steps_per_cycle
-        self._min_observations = min_observations_per_arm
+        self._min_version_episodes = min_version_episodes
+        self._min_reservoir_size = min_reservoir_size
         self._candidate_creator = candidate_creator
         self._rng = random.Random(seed)
 
@@ -368,10 +377,14 @@ class SkillBankAdoptionCycle:
 
         baseline_m, baseline_n = self.reservoir.cycle_counts(self._baseline.version_id)
         candidate_m, candidate_n = self.reservoir.cycle_counts(self._candidate.version_id)
-        if min(baseline_n, candidate_n) < self._min_observations:
+        total_episodes = baseline_n + candidate_n
+        if total_episodes < self._min_version_episodes:
             logger.info(
-                "Adoption cycle %d at step %d underexposed (baseline n=%d, candidate n=%d); extending",
-                self._cycle, step, baseline_n, candidate_n,
+                "Adoption cycle %d at step %d has %d/%d episodes; extending",
+                self._cycle,
+                step,
+                total_episodes,
+                self._min_version_episodes,
             )
             return None
 
@@ -439,11 +452,11 @@ class SkillBankAdoptionCycle:
             self._candidate_arm.set_memory(self._memory_estimator.memory)
 
     def _next_trial(self) -> None:
+        entries = self.reservoir.entries()
+        if len(entries) < self._min_reservoir_size:
+            return
         try:
-            proposal_id = self._candidate_creator(
-                self._baseline,
-                self.reservoir.entries(),
-            )
+            proposal_id = self._candidate_creator(self._baseline, entries)
             if inspect.isawaitable(proposal_id):
                 proposal_id = asyncio.run(proposal_id)
         except Exception as exc:

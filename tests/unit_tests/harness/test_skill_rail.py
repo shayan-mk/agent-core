@@ -218,16 +218,18 @@ async def test_skill_rail_all_mode_injects_skill_prompt(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_skill_selector_controls_current_session_view(tmp_path: Path):
+async def test_skill_selector_inlines_selected_guidance(tmp_path: Path):
     skills_root = tmp_path / "skills"
     skills_root.mkdir(parents=True, exist_ok=True)
     _write_skill(
         skills_root,
         "invoice-parser",
         "Parse invoice pdf files",
+        "Extract invoice totals before answering.",
         when_to_use="When the task contains an invoice PDF",
     )
-    _write_skill(skills_root, "xlsx-writer", "Write xlsx reports")
+    long_guide = "LONG_GUIDE_MARKER " + "x" * 600
+    _write_skill(skills_root, "xlsx-writer", "Write xlsx reports", long_guide)
 
     selected = {"invoice-parser"}
     rail = SkillUseRail(
@@ -235,6 +237,7 @@ async def test_skill_selector_controls_current_session_view(tmp_path: Path):
         skill_mode="all",
         include_tools=False,
         skill_selector=lambda skills, _ctx: [skill for skill in skills if skill.name in selected],
+        inline_selected_skills=True,
     )
 
     async def read_file(path: str, **_kwargs):
@@ -244,7 +247,8 @@ async def test_skill_selector_controls_current_session_view(tmp_path: Path):
         )
 
     rail.set_sys_operation(SimpleNamespace(fs=lambda: SimpleNamespace(read_file=read_file)))
-    rail.system_prompt_builder = SystemPromptBuilder()
+    rail.system_prompt_builder = SystemPromptBuilder(language="en")
+    rail.attachment_manager = PromptAttachmentManager()
     session = _SessionState("selected-skills")
     ctx = AgentCallbackContext(agent=None, inputs=ModelCallInputs(tools=[]), session=session)
 
@@ -252,15 +256,41 @@ async def test_skill_selector_controls_current_session_view(tmp_path: Path):
     await rail.before_model_call(ctx)
     assert _sorted_skill_names(rail.get_skills_for_session(session)) == ["invoice-parser"]
     prompt = rail.system_prompt_builder.build()
-    assert "invoice-parser" in prompt and "xlsx-writer" not in prompt
+    assert "invoice-parser" in prompt and "xlsx-writer" in prompt
     assert "When the task contains an invoice PDF" in prompt
+    assert "guidance is attached automatically" in prompt
+    assert "Read the relevant SKILL.md" not in prompt
+    attachments = await rail.attachment_manager.collect_for_session("selected-skills")
+    assert "Extract invoice totals before answering." in attachments[0].content
+    assert "Create the workbook with headers." not in attachments[0].content
+    assert ctx.extra["skill_use.active_skills"] == ["invoice-parser"]
 
     selected.clear()
     selected.add("xlsx-writer")
     await rail.before_model_call(ctx)
     assert _sorted_skill_names(rail.get_skills_for_session(session)) == ["xlsx-writer"]
-    prompt = rail.system_prompt_builder.build()
-    assert "invoice-parser" not in prompt and "xlsx-writer" in prompt
+    attachments = await rail.attachment_manager.collect_for_session("selected-skills")
+    assert "Extract invoice totals before answering." not in attachments[0].content
+    assert "LONG_GUIDE_MARKER" not in attachments[0].content
+    assert "Read the full guide with skill_tool" in attachments[0].content
+
+    plain_rail = SkillUseRail(
+        skills_dir=str(skills_root),
+        skill_mode="all",
+        include_tools=False,
+        skill_selector=lambda skills, _ctx: [skill for skill in skills if skill.name in selected],
+    )
+    plain_rail.set_sys_operation(SimpleNamespace(fs=lambda: SimpleNamespace(read_file=read_file)))
+    plain_rail.system_prompt_builder = SystemPromptBuilder(language="en")
+    plain_ctx = AgentCallbackContext(
+        agent=None,
+        inputs=ModelCallInputs(tools=[]),
+        session=_SessionState("plain-selected-skills"),
+    )
+    await plain_rail.before_invoke(plain_ctx)
+    await plain_rail.before_model_call(plain_ctx)
+    plain_prompt = plain_rail.system_prompt_builder.build()
+    assert "invoice-parser" not in plain_prompt and "xlsx-writer" in plain_prompt
 
 
 @pytest.mark.asyncio

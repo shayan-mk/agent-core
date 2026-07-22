@@ -56,7 +56,11 @@ def _entry(success: bool, *, version: str = "bank_000001") -> ReservoirEntry:
         task_key="shared-task",
         payload={
             "turns": [
-                {"action": [{"name": "search", "arguments": "x"}], "observation": "result"},
+                {
+                    "action": [{"name": "search", "arguments": "x"}],
+                    "observation": "result",
+                    "active_skills": ["search"],
+                },
                 {"action": [{"name": "answer", "arguments": "y"}], "observation": "done"},
             ]
         },
@@ -143,6 +147,8 @@ async def test_creator_pipeline_uses_grouped_evidence_assertions_and_history(tmp
         assert "previous-proposal" in prompt
         assert '"name": "uses-search"' in prompt
         assert "premature" in prompt
+        assert 'Available action vocabulary: ["answer", "lookup", "search"]' in prompt
+        assert '"active_observations": 2' in prompt
         return json.dumps(
             {
                 "assertion": "A verification skill prevents premature answers",
@@ -162,7 +168,13 @@ async def test_creator_pipeline_uses_grouped_evidence_assertions_and_history(tmp
 
     monkeypatch.setattr("openjiuwen.agent_evolving.skill_bank.creator.invoke_text_with_retry", fake_invoke)
     monkeypatch.setattr("openjiuwen.agent_evolving.skill_bank.candidate.invoke_text_with_retry", fake_invoke)
-    pipeline = SkillBankCreatorPipeline(tmp_path / "bank", MagicMock(), "creator-model", language="en")
+    pipeline = SkillBankCreatorPipeline(
+        tmp_path / "bank",
+        MagicMock(),
+        "creator-model",
+        language="en",
+        action_vocabulary=("lookup",),
+    )
     proposal_id = await pipeline(baseline, [_entry(True), _entry(False)])
 
     proposal = store.get_proposal(proposal_id)

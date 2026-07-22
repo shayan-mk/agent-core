@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from openjiuwen.agent_evolving.skill_bank import SkillBankStore
 from openjiuwen.agent_evolving.skill_bank.candidate import SkillBankCandidateBuilder
 from openjiuwen.agent_evolving.skill_bank.models import (
@@ -13,6 +15,7 @@ from openjiuwen.agent_evolving.skill_bank.models import (
     SkillOperation,
     SkillOperationType,
 )
+from openjiuwen.core.common.exception.errors import BaseError
 
 
 def _write_skill(root: Path, name: str, body: str) -> Path:
@@ -52,3 +55,26 @@ def test_candidate_builder_applies_repo_operations_without_mutating_sources(tmp_
     assert not (result.candidate.skills_dir / "delete-me").exists()
     assert "old" in (parent_root / "modify-me" / "SKILL.md").read_text(encoding="utf-8")
     assert (parent_root / "delete-me").is_dir()
+
+
+def test_candidate_builder_enforces_bank_capacity(tmp_path: Path) -> None:
+    parent_root = tmp_path / "parent"
+    _write_skill(parent_root, "first", "one")
+    _write_skill(parent_root, "second", "two")
+    addition = _write_skill(tmp_path / "inputs", "third", "three")
+    store = SkillBankStore(tmp_path / "bank")
+    parent = store.create_snapshot(parent_root)
+    proposal = SkillBankProposal(
+        proposal_id="over-capacity",
+        parent_version_id=parent.version_id,
+        operations=(
+            SkillOperation(
+                SkillOperationType.ADD,
+                "third",
+                source_path=str(addition),
+            ),
+        ),
+    )
+
+    with pytest.raises(BaseError, match="maximum is 2"):
+        SkillBankCandidateBuilder(store, max_bank_skills=2).build(proposal)

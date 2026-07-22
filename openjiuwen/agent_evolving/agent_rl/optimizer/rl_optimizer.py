@@ -93,7 +93,8 @@ class OfflineRLOptimizer(BaseRLOptimizer):
 
     def set_tools(self, tools: list) -> None:
         self._tools = tools
-        self._tool_names = [
+        # Preserve the list shared with a creator configured before the tools.
+        self._tool_names[:] = [
             getattr(t, "name", getattr(t, "__name__", str(t))) for t in tools
         ]
 
@@ -137,7 +138,9 @@ class OfflineRLOptimizer(BaseRLOptimizer):
             model,
             language=language,
             max_task_groups=max_task_groups,
+            max_bank_skills=self.config.skill_rl.max_bank_skills,
             minimum_trigger_fire_rate=minimum_trigger_fire_rate,
+            action_vocabulary=self._tool_names,
         )
 
     def _get_rollout_reward_fn(self):

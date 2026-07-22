@@ -16,6 +16,9 @@ from openjiuwen.core.single_agent.rail.base import AgentCallbackContext
 from openjiuwen.core.single_agent.skills.skill_manager import Skill
 from openjiuwen.harness.prompts.sections import SectionName
 from openjiuwen.harness.prompts.sections.skills import (
+    MAX_INLINE_SKILL_GUIDANCE_CHARS,
+    SKILL_RAIL_INLINE_ATTACHMENT_HEADER,
+    SKILL_RAIL_INLINE_OVERSIZED_BODY,
     build_all_mode_skill_prompt,
     build_skill_line,
     build_skill_lines,
@@ -26,6 +29,9 @@ from openjiuwen.harness.rails.base import DeepAgentRail
 from openjiuwen.harness.rails._multimodal import should_enable_read_image_multimodal
 from openjiuwen.harness.tools import BashTool, CodeTool, ReadFileTool, ListSkillTool, SkillTool
 from openjiuwen.agent_evolving.checkpointing import EvolutionStore
+
+
+ACTIVE_SKILLS_EXTRA_KEY = "skill_use.active_skills"
 
 
 class SkillUseRail(DeepAgentRail):
@@ -53,6 +59,7 @@ class SkillUseRail(DeepAgentRail):
         evolution_store: Optional[EvolutionStore] = None,
         multimodal_skill_mode: str = "hint",
         skill_selector: Optional[Callable[[Sequence[Skill], AgentCallbackContext], Sequence[Skill]]] = None,
+        inline_selected_skills: bool = False,
     ):
         """Initialize SkillUseRail.
 
@@ -68,8 +75,11 @@ class SkillUseRail(DeepAgentRail):
             disabled_skills: Optional deny-list of skill names. Supports str or List[str].
             evolution_store: Optional EvolutionStore for progressive disclosure experience text.
             multimodal_skill_mode: ``hint`` (default), ``attach``, or ``branch``.
-            skill_selector: Optional per-model-call visibility filter. Its result
-                controls prompt and tool exposure instead of the session baseline.
+            skill_selector: Optional per-model-call active-skill filter. Its result
+                controls tool exposure and the dynamic skill guidance.
+            inline_selected_skills: Attach concise selected SKILL.md guidance to
+                each model call. Longer package guides remain available through
+                the skill file tools.
         """
         super().__init__()
 
@@ -89,6 +99,7 @@ class SkillUseRail(DeepAgentRail):
         self.evolution_store: Optional[EvolutionStore] = evolution_store
         self.multimodal_skill_mode = multimodal_skill_mode
         self.skill_selector = skill_selector
+        self.inline_selected_skills = inline_selected_skills
 
         self.skills: List[Skill] = []
         self._selected_skills: List[Skill] = []
@@ -99,6 +110,8 @@ class SkillUseRail(DeepAgentRail):
         self._skill_cache: Dict[str, Skill] = {}
         self._skill_update_at: Dict[str, float] = {}
         self._skill_order: List[str] = []
+        # SKILL.md body per skill directory, populated only for inline mode.
+        self._skill_bodies: Dict[Path, str] = {}
 
         # Cache evolution experience texts per skill name.
         self._evolution_texts: Dict[str, str] = {}
@@ -126,6 +139,7 @@ class SkillUseRail(DeepAgentRail):
         self._skill_cache.clear()
         self._skill_update_at.clear()
         self._skill_order.clear()
+        self._skill_bodies.clear()
         self.skills = []
         self._selected_skills = []
         self._skills_snapshot_signature = None
@@ -136,6 +150,7 @@ class SkillUseRail(DeepAgentRail):
             self._skill_cache.clear()
             self._skill_update_at.clear()
             self._skill_order.clear()
+            self._skill_bodies.clear()
 
         await self._refresh_skills_incrementally()
         self.skills = self._filter_skills(self._collect_skills_in_order())
@@ -190,8 +205,10 @@ class SkillUseRail(DeepAgentRail):
 
         stale_keys = [key for key in self._skill_cache.keys() if key not in discovered_keys]
         for key in stale_keys:
-            self._skill_cache.pop(key, None)
+            stale_skill = self._skill_cache.pop(key, None)
             self._skill_update_at.pop(key, None)
+            if stale_skill is not None:
+                self._skill_bodies.pop(stale_skill.directory, None)
 
         self._skill_order = [key for key in ordered_keys if key in self._skill_cache]
 
@@ -200,10 +217,20 @@ class SkillUseRail(DeepAgentRail):
         skill_md_path = skill_dir / "SKILL.md"
 
         description = ""
+        body = ""
         try:
-            description = await self._load_description(skill_md_path)
+            yaml_data, body = await self._load_yaml(skill_md_path)
+            if yaml_data is None or "description" not in yaml_data:
+                raise KeyError("SKILL.md file does not contain a description field")
+            description = str(yaml_data["description"])
+            when_to_use = str(yaml_data.get("when_to_use", "")).strip()
+            if when_to_use:
+                description = f"{description}\n  when_to_use: {when_to_use}"
         except Exception as exc:
             logger.warning(f"Failed to load description from {skill_md_path}: {exc}")
+
+        if self.inline_selected_skills:
+            self._skill_bodies[skill_dir] = body.strip()
 
         skill = Skill(
             name=skill_dir.name,
@@ -429,9 +456,19 @@ class SkillUseRail(DeepAgentRail):
         await self._fetch_evolution_texts([*baseline_skills, *self.skills])
         if self.skill_selector is not None:
             self._selected_skills = list(self.skill_selector(self.skills, ctx))
-            prompt_skills = self._selected_skills
         else:
-            prompt_skills = baseline_skills
+            self._selected_skills = []
+        if self.skill_selector is not None or self.inline_selected_skills:
+            active_skills = self._selected_skills if self.skill_selector is not None else self.skills
+            ctx.extra[ACTIVE_SKILLS_EXTRA_KEY] = [skill.name for skill in active_skills]
+        else:
+            ctx.extra.pop(ACTIVE_SKILLS_EXTRA_KEY, None)
+
+        prompt_skills = (
+            baseline_skills
+            if self.inline_selected_skills or self.skill_selector is None
+            else self._selected_skills
+        )
         skills_section = self._build_skills_section(prompt_skills)
         if skills_section is not None:
             self.system_prompt_builder.add_section(skills_section)
@@ -486,7 +523,7 @@ class SkillUseRail(DeepAgentRail):
             return build_skills_section(
                 skill_lines=build_skill_lines(body_lines),
                 language=self.system_prompt_builder.language,
-                mode="all",
+                mode="inline" if self.inline_selected_skills else "all",
             )
         else:
             return build_skills_section(
@@ -585,18 +622,21 @@ class SkillUseRail(DeepAgentRail):
         if manager is None:
             return
         current_skills = self._selected_skills if self.skill_selector is not None else self.skills
-        baseline_by_name = {skill.name: skill for skill in baseline_skills}
-        current_by_name = {skill.name: skill for skill in current_skills}
-        additions = [skill for skill in current_skills if skill.name not in baseline_by_name]
-        removals = [skill for skill in baseline_skills if skill.name not in current_by_name]
         writer = manager.bind_context(ctx)
         if not writer.session_id:
             return
-        content = self._build_runtime_skill_change_content(
-            additions,
-            removals,
-            baseline_skills,
-        )
+        if self.inline_selected_skills:
+            content = self._build_inline_selected_skill_content(current_skills)
+        else:
+            baseline_by_name = {skill.name: skill for skill in baseline_skills}
+            current_by_name = {skill.name: skill for skill in current_skills}
+            additions = [skill for skill in current_skills if skill.name not in baseline_by_name]
+            removals = [skill for skill in baseline_skills if skill.name not in current_by_name]
+            content = self._build_runtime_skill_change_content(
+                additions,
+                removals,
+                baseline_skills,
+            )
         if not content:
             await writer.clear_section(self._RUNTIME_ATTACHMENT_SECTION)
             return
@@ -607,6 +647,21 @@ class SkillUseRail(DeepAgentRail):
             kind=PromptAttachmentKind.SKILL,
             source="skill_use_rail",
         )
+
+    def _build_inline_selected_skill_content(self, skills: List[Skill]) -> str:
+        if not skills:
+            return ""
+        language = getattr(self.system_prompt_builder, "language", "cn")
+        key = "en" if str(language).lower().startswith("en") else "cn"
+        lines = [SKILL_RAIL_INLINE_ATTACHMENT_HEADER[key]]
+        for skill in skills:
+            lines.extend([f"## {skill.name}", self._get_skill_description(skill)])
+            body = self._skill_bodies.get(skill.directory, "")
+            if 0 < len(body) <= MAX_INLINE_SKILL_GUIDANCE_CHARS:
+                lines.append(body)
+            elif body:
+                lines.append(SKILL_RAIL_INLINE_OVERSIZED_BODY[key].format(skill_name=skill.name))
+        return "\n\n".join(lines)
 
     def _build_runtime_skill_change_content(
         self,
@@ -747,17 +802,6 @@ class SkillUseRail(DeepAgentRail):
                 return yaml_data, body.lstrip()
 
         return None, text
-
-    async def _load_description(self, path: Path) -> str:
-        """Load description from YAML front matter."""
-        yaml_data, _ = await self._load_yaml(path)
-        if yaml_data is None or "description" not in yaml_data:
-            raise KeyError("SKILL.md file does not contain a description field")
-        description = str(yaml_data["description"])
-        when_to_use = str(yaml_data.get("when_to_use", "")).strip()
-        if when_to_use:
-            description = f"{description}\n  when_to_use: {when_to_use}"
-        return description
 
     @staticmethod
     def _skill_md_path(skill: Skill) -> Path:

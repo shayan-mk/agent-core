@@ -50,7 +50,9 @@ class SkillBankCreatorPipeline:
         *,
         language: str = "cn",
         max_task_groups: int = 6,
+        max_bank_skills: int = 8,
         minimum_trigger_fire_rate: float = 0.5,
+        action_vocabulary: Sequence[str] = (),
     ) -> None:
         if language not in SKILL_BANK_CONTRASTIVE_PROMPT:
             raise _param(f"unsupported creator language: {language}")
@@ -62,7 +64,9 @@ class SkillBankCreatorPipeline:
         self._language = language
         self._assertions: dict[str, TrajectoryAssertion] = {}
         self._max_task_groups = max_task_groups
+        self._max_bank_skills = max_bank_skills
         self._minimum_trigger_fire_rate = minimum_trigger_fire_rate
+        self._action_vocabulary = action_vocabulary
         self._store: SkillBankStore | None = None
         self._package_creator: SkillBankPackageCreator | None = None
 
@@ -76,7 +80,7 @@ class SkillBankCreatorPipeline:
         entries: Sequence[ReservoirEntry],
     ) -> str | None:
         evidence = [entry for entry in entries if entry.payload is not None]
-        if not evidence or all(entry.success for entry in evidence):
+        if not evidence:
             return None
         store, package_creator = self._components()
         insights = await self._contrast_task_groups(evidence)
@@ -89,6 +93,7 @@ class SkillBankCreatorPipeline:
             "insight_groups": diagnosis.get("insight_groups", []),
             "assertion_grades": [grade.to_dict() for grade in grade_assertions(self.assertions, evidence)],
             "skill_trigger_rates": self._skill_trigger_rates(parent, evidence),
+            "skill_usage": self._skill_usage(parent, evidence),
         }
         result = await package_creator.create(
             parent,
@@ -111,11 +116,15 @@ class SkillBankCreatorPipeline:
             self._store = SkillBankStore(self._bank_root)
         if self._package_creator is None:
             self._package_creator = SkillBankPackageCreator(
-                SkillBankCandidateBuilder(self._store),
+                SkillBankCandidateBuilder(
+                    self._store,
+                    max_bank_skills=self._max_bank_skills,
+                ),
                 self._llm,
                 self._model,
                 language=self._language,
                 minimum_trigger_fire_rate=self._minimum_trigger_fire_rate,
+                action_vocabulary=self._action_vocabulary,
             )
         return self._store, self._package_creator
 
@@ -172,6 +181,40 @@ class SkillBankCreatorPipeline:
             rates[skill_name] = skill_trigger_fire_rate(SkillTrigger.from_skill_md(content), entries)
         return rates
 
+    @staticmethod
+    def _skill_usage(
+        parent: BankVersionRef,
+        entries: Sequence[ReservoirEntry],
+    ) -> dict[str, dict[str, float | int | None]]:
+        tracked: list[tuple[ReservoirEntry, set[str]]] = []
+        for entry in entries:
+            fired: set[str] = set()
+            seen = False
+            for turn in (entry.payload or {}).get("turns", []):
+                if not isinstance(turn, dict):
+                    continue
+                active_skills = turn.get("active_skills")
+                if isinstance(active_skills, list):
+                    seen = True
+                    fired.update(str(name) for name in active_skills)
+            if seen:
+                tracked.append((entry, fired))
+        if not tracked:
+            return {}
+
+        usage = {}
+        for skill_name in parent.manifest.skill_names:
+            active = [entry for entry, fired in tracked if skill_name in fired]
+            inactive = [entry for entry, fired in tracked if skill_name not in fired]
+            usage[skill_name] = {
+                "activation_rate": len(active) / len(tracked),
+                "active_observations": len(active),
+                "active_mean_reward": _mean_reward(active),
+                "inactive_observations": len(inactive),
+                "inactive_mean_reward": _mean_reward(inactive),
+            }
+        return usage
+
     def _apply_assertion_operations(self, operations: Any) -> None:
         if not isinstance(operations, list):
             return
@@ -205,6 +248,10 @@ def _task_groups(entries: Sequence[ReservoirEntry]) -> list[tuple[str, list[Rese
             item[0],
         ),
     )
+
+
+def _mean_reward(entries: Sequence[ReservoirEntry]) -> float | None:
+    return sum(entry.reward for entry in entries) / len(entries) if entries else None
 
 
 __all__ = ["SkillBankCreatorPipeline"]

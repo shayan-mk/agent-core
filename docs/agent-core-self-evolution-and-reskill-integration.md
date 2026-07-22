@@ -1,7 +1,8 @@
 # Agent-Core Self-Evolving Skill Bank
 
 > Design based on `upstream/develop`, ReSkill v2
-> (2026-06-08), SkillOS v1 (2026-05-07), and SkillRL v1 (2026-02-09).
+> (2026-06-08) and its [official implementation](https://github.com/amazon-science/reskill),
+> SkillOS v1 (2026-05-07), and SkillRL v1 (2026-02-09).
 
 ## Executive Decision
 
@@ -107,7 +108,7 @@ ReSkill controller.
 
 | Method | Mechanism | Reported setup | Use in agent-core |
 |---|---|---|---|
-| [ReSkill](https://arxiv.org/abs/2606.01619) | An assertion-driven creator proposes ADD/MODIFY/DELETE. Old and new banks share GRPO rollout groups; discounted Thompson Sampling allocates traffic and a reward gate accepts or rejects each candidate. | Qwen3-4B/8B policies, Claude 4.5 Sonnet creator, one or two 8xA100 nodes depending on benchmark. | Primary co-evolution and adoption protocol. |
+| [ReSkill](https://arxiv.org/abs/2606.01619) | An assertion-driven creator proposes ADD/MODIFY/DELETE. Old and new banks share GRPO rollout groups; discounted Thompson Sampling allocates traffic and a reward gate accepts or rejects each candidate. | Qwen3-4B/8B policies, Claude 4.5 Sonnet creator, bank capacity 8, and one or two 8xA100 nodes depending on benchmark. | Primary co-evolution and adoption protocol. |
 | [SkillRL](https://arxiv.org/abs/2602.08234) | A teacher distills successes and counterfactual lessons from failures. General skills are always supplied and up to six task skills are retrieved. Cold-start SFT teaches skill use; low-performing categories trigger bank updates during GRPO. | Qwen2.5-7B executor, OpenAI o3 teacher, 8 H100 GPUs. | Retrieval hierarchy only. Cold-start SFT and unconditional bank union are excluded. |
 | [SkillOS](https://arxiv.org/abs/2605.06614) | A trainable curator edits a Markdown SkillRepo for grouped task streams. BM25 retrieves skills and curator GRPO combines task, call-validity, content-quality, and compression rewards. | Qwen3-8B curator/executor, Qwen3-32B judge, 16 H100 GPUs. | BM25 retrieval only; no separate curator is implemented. |
 
@@ -141,6 +142,13 @@ creator/teacher models while RL updates the executor policy.
 8. **Control active-bank changes.** Imported and shared packages are bootstrap
    inputs. After initialization, only an accepted ReSkill proposal changes the
    active bank.
+9. **Bound the active bank.** Default to ReSkill's capacity of eight skills.
+   Below capacity the creator may ADD; at capacity it must MODIFY, DELETE, or
+   pair ADD with DELETE. Candidate validation enforces the configured limit.
+10. **Load triggered guidance directly.** Keep the ordinary skill catalog stable,
+    but attach concise selected SKILL.md guidance to each model call and record
+    the selected names with the RL trajectory. Long guides and support files
+    remain available through the existing skill tool.
 
 ## 4. Target Architecture
 
@@ -193,20 +201,38 @@ SkillBankCreatorPipeline(parent, reservoir) -> package candidate
 
 `SkillBankCandidateBuilder` copies the parent, applies the creator's declared
 package operations, validates the final package set, records provenance, and
-snapshots the result. DELETE affects only the candidate copy.
+snapshots the result. DELETE affects only the candidate copy. The builder also
+enforces the configured bank capacity, independently of creator output.
 
 The first-party ReSkill creator groups retained episodes by stable task key and
 prioritizes groups containing contrasting outcomes and versions. It performs
 contrastive diagnosis, grades deterministic trajectory assertions, considers
 proposal history, and emits package ADD/MODIFY/DELETE operations. Diagnosis and
 authoring use the same configured creator model sequentially, avoiding another
-resident LLM.
+resident LLM. The final structured call combines ReSkill's recommendation and
+package-authoring roles; capacity context steers it toward MODIFY/DELETE as the
+bank fills. It samples at most six task groups by default rather than ReSkill's
+30, a configurable reduction in creator calls for the edge-device target. When
+no trial is active, agent-core also retries creation at the configured evolution
+interval rather than on every training step.
+
+The creator receives the configured tool vocabulary, observed actions, and
+per-skill activation, active-reward, and inactive-reward summaries. It may
+therefore prune rarely activated guidance or guidance whose behavior the policy
+has internalized, even when retained trajectories are successful. Authored
+SKILL.md bodies are limited to 500 characters; longer detail belongs in package
+support files and remains available through `SkillTool`.
 
 Authored packages declare `scope`, `when_to_use`, `trigger_type`, and an optional
 `trigger_pattern`. Action-pattern triggers must fire on at least half of retained
 episodes before building a candidate; failed validation is returned to the
 creator for a bounded retry. This checks that a trigger is usable, not that the
 candidate is beneficial. Reward evidence remains the promotion gate.
+
+ReSkill stores `when_to_use`, action, and examples in a dedicated structured
+record. Agent-core keeps its existing package contract instead: trigger metadata
+lives in SKILL.md front matter and actionable instructions/examples live in the
+bounded Markdown body. This avoids a parallel skill format or loader.
 
 ### 4.3 Evaluation and Adoption
 
@@ -226,9 +252,13 @@ w      = (1 + observations / M)^-1
 
 The controller accepts when `E[p_candidate] > E[p_baseline]`, keeps a bounded
 trajectory reservoir (default 200), and can estimate memory `M` from completed
-adoption windows by predictive likelihood. It checkpoints the trained policy
-before a bank decision, updates the active pointer and audit record, then
-schedules the next candidate.
+adoption windows by predictive likelihood. Candidate creation starts after the
+reservoir reaches 100 retained episodes by default. It checkpoints the trained
+policy before a bank decision, updates the active pointer and audit record, then
+schedules the next candidate. A trial runs for at least the configured cadence
+(default five policy steps) and 50 comparable baseline-plus-candidate episodes;
+the exploration floor keeps both arms represented without imposing a separate
+per-arm threshold.
 
 ### 4.4 Retrieval and Triggers
 
@@ -241,9 +271,12 @@ applies deterministic triggers:
 - `beginning`: visible on the first model call; and
 - `action_pattern`: visible after a matching prior tool action.
 
-Packages without trigger metadata retain general behavior. `when_to_use` is
-included in the ordinary skill description. The selected view controls prompt
-and `SkillTool` exposure; no alternate rail, tool, or skill model is introduced.
+Packages without trigger metadata retain general behavior. The ordinary skill
+catalog remains in the stable system prompt. For triggered loading, the existing
+rail places each selected skill's description, `when_to_use`, and SKILL.md body
+in a dynamic attachment, while the selected view controls `SkillTool` exposure
+for package support files. Selected names are recorded per model call in the
+normal RL trajectory; no alternate rail, tool, or skill model is introduced.
 
 ## 5. Agent-Core Integration
 
@@ -251,7 +284,7 @@ and `SkillTool` exposure; no alternate rail, tool, or skill model is introduced.
 |---|---|
 | Harness assembly | Shared source resolution and optional explicit skill roots feed the existing `SkillUseRail`. Normal agents and RL agents use the same `resolve_deep_agent_parts` path. |
 | RL task/runtime | `RLTask` and `RolloutMessage` carry version and stable task keys. The built-in factory resolves one version before constructing the agent. |
-| Evidence | `TrainingCoordinator` observes messages before classifier/validator filtering. `FileRolloutStore` persists version labels. |
+| Evidence | `TrainingCoordinator` observes messages before classifier/validator filtering. `RLRail` records per-turn active skills, and `FileRolloutStore` persists them with version labels. |
 | Training boundary | `MainTrainer` commits evidence only after a successful policy step and invokes the adoption cycle without changing GRPO internals. |
 | Creation | `OfflineRLOptimizer.set_skill_creator()` configures the ReSkill creator used by the adoption cycle. |
 | Bootstrap | Existing source adapters materialize packages locally before `initialize_skill_bank()` creates and activates the initial version. |
@@ -278,7 +311,8 @@ concurrently without state leakage; promotion and rollback are atomic.
 
 - Effective-root materialization with ordinary harness precedence and state.
 - Package candidates built from an isolated parent copy through the ReSkill
-  creator and shared candidate builder.
+  creator and shared candidate builder, with a configurable capacity defaulting
+  to eight skills.
 - Complete provenance and proposal audit before a candidate enters RL rollout
   allocation.
 
@@ -290,16 +324,18 @@ construction cannot mutate the active version.
 - Version identity from task creation through runtime, persistence, and audit.
 - Thompson assignment for each rollout attempt and one bank observation per
   whole trajectory.
+- Automatic inline loading and per-turn recording of deterministically triggered
+  skills through the existing skill and trajectory rails.
 - Central reservoir, discounted Thompson allocation, decision hook,
   and scheduled ReSkill creator around the existing rollout/train loop.
 
-Exit gate: version exposure is recorded, both arms meet the configured minimum
-observations, and policy training retains its rollout budget.
+Exit gate: version exposure is recorded, the trial reaches the configured total
+episode minimum, and policy training retains its rollout budget.
 
 ### P3: Creation and Retrieval
 
 - Contrastive success/failure diagnosis, deterministic assertion grading,
-  proposal history, and trigger validation.
+  proposal history, activation-conditioned evidence, and trigger validation.
 - ReSkill package ADD/MODIFY/DELETE through the built-in creator.
 - BM25 allow-list retrieval and deterministic per-call triggers through the
   existing rail.
@@ -318,3 +354,6 @@ bypassing the version gate.
   writes evolution back to a public source.
 - A dedicated SkillOS curator, cold-start SFT, arbitrary proposal plugins, and
   automatic remote-source refresh are not implemented.
+- Trainer checkpoints cover policy/trainer state. Mid-cycle serialization of the
+  in-memory reservoir and bandit controller is outside this integration; durable
+  bank versions and proposal decisions remain the restart boundary.

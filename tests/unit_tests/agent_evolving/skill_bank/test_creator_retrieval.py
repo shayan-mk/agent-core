@@ -72,6 +72,7 @@ async def test_creator_builds_candidate_from_llm_operations(tmp_path: Path, monk
     async def fake_invoke(llm, model, prompt, *, policy, **kwargs):
         assert "Calculate arithmetic expressions" in prompt
         assert '"version_id": "bank_000001"' in prompt
+        assert "Bank capacity: 1/8" in prompt
         return json.dumps({
             "assertion": "A csv-parsing skill prevents the observed format failures",
             "operations": [
@@ -89,7 +90,8 @@ async def test_creator_builds_candidate_from_llm_operations(tmp_path: Path, monk
                     "skill_name": "calculator",
                     "skill_md": (
                         "---\nname: calculator\ndescription: Calculate reliably\nscope: task\n"
-                        "when_to_use: When arithmetic is required\ntrigger_type: general\n---\n"
+                        "when_to_use: When arithmetic is required\ntrigger_type: general\n---\n\n"
+                        "Verify operands before calculating."
                     ),
                 },
             ],
@@ -124,9 +126,12 @@ def test_idle_cycle_requests_a_candidate_on_schedule(tmp_path: Path) -> None:
     store, baseline = _store_with_baseline(tmp_path)
     supplied = []
     cycle = SkillBankAdoptionCycle(
-        store, steps_per_cycle=2,
+        store,
+        steps_per_cycle=2,
+        min_reservoir_size=1,
         candidate_creator=lambda ref, entries: supplied.append(ref.version_id),
     )
+    cycle.reservoir.add(_entry(True))
     assert cycle.on_train_step(1) is None and supplied == []
     assert cycle.on_train_step(2) is None and supplied == [baseline.version_id]
 

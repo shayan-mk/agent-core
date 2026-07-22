@@ -71,6 +71,39 @@ SKILL_RAIL_ALL_MODE_INSTRUCTION: Dict[str, str] = {
     "en": SKILL_RAIL_ALL_MODE_INSTRUCTION_EN,
 }
 
+SKILL_RAIL_INLINE_MODE_PROMPT = {
+    "cn": (
+        "# 技能\n\n相关的简要 Skill 指导会在每次模型调用时自动附加。\n\n可用技能：\n"
+        "{skill_lines}\n\n请直接应用已附加的指导；完整指南和支持文件仍可按提示读取。"
+    ),
+    "en": (
+        "# Skills\n\nRelevant concise skill guidance is attached automatically for each model call.\n\n"
+        "Available skills:\n{skill_lines}\n\nApply attached guidance directly; read full guides or support files when prompted."
+    ),
+}
+
+# Shared authoring and inline-injection budget.
+MAX_INLINE_SKILL_GUIDANCE_CHARS = 500
+
+SKILL_RAIL_INLINE_ATTACHMENT_HEADER: Dict[str, str] = {
+    "cn": "以下 Skill 指导已为本次模型调用激活。请直接应用；仅在指导引用包内文件时再读取。",
+    "en": (
+        "The following skill guidance is active for this model call. Apply it directly; "
+        "read package files only when the guidance references them."
+    ),
+}
+
+SKILL_RAIL_INLINE_OVERSIZED_BODY: Dict[str, str] = {
+    "cn": (
+        "应用此 Skill 前请先用 skill_tool 阅读完整指南"
+        "（skill_name: {skill_name}, relative_file_path: SKILL.md）。"
+    ),
+    "en": (
+        "Read the full guide with skill_tool before applying this skill "
+        "(skill_name: {skill_name}, relative_file_path: SKILL.md)."
+    ),
+}
+
 # ---------------------------------------------------------------------------
 # Auto-list mode prompt (bilingual)
 # ---------------------------------------------------------------------------
@@ -165,9 +198,9 @@ def build_skills_section(
     """Build a PromptSection for skills.
 
     Args:
-        skill_lines: Pre-rendered skill lines (only used in 'all' mode).
+        skill_lines: Pre-rendered skill lines (used in 'all' and 'inline' modes).
         language: 'cn' or 'en'.
-        mode: 'all' or 'auto_list'.
+        mode: 'all', 'inline', or 'auto_list'.
 
     Returns:
         A PromptSection instance, or None if mode is unrecognised.
@@ -176,6 +209,9 @@ def build_skills_section(
 
     if mode == "all":
         content = build_all_mode_skill_prompt(skill_lines, language)
+    elif mode == "inline":
+        template = SKILL_RAIL_INLINE_MODE_PROMPT.get(language, SKILL_RAIL_INLINE_MODE_PROMPT["cn"])
+        content = template.format(skill_lines=skill_lines)
     elif mode == "auto_list":
         content = build_auto_list_mode_skill_prompt(language)
     else:

@@ -47,6 +47,7 @@ from openjiuwen.harness.rails.security import (
     SecurityRail,
 )
 from openjiuwen.harness.rails.skills import (
+    ACTIVE_SKILLS_EXTRA_KEY,
     SkillCreateRail,
     SkillUseRail,
     TeamSkillCreateRail,
@@ -64,6 +65,7 @@ from openjiuwen.harness.rails.task_planning_rail import TaskPlanningRail
 # fmt: on
 
 __all__ = [
+    "ACTIVE_SKILLS_EXTRA_KEY",
     "AgentModeRail",
     "AskUserPayload",
     "AskUserRail",
