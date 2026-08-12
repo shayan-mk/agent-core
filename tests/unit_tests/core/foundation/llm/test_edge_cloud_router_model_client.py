@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from types import ModuleType
 from collections.abc import AsyncIterator
@@ -67,23 +68,31 @@ def _child_config(model: str, privacy_scope: str | None = None) -> dict:
     return config
 
 
-def _router_config(*, mode: str = "llm", privacy_enabled: bool = False) -> ModelClientConfig:
+def _router_config(
+    *,
+    mode: str = "llm",
+    privacy_enabled: bool = False,
+    evolution: dict | None = None,
+) -> ModelClientConfig:
     complexity: dict = {"mode": mode, "privacy_scope": "local"}
     if mode == "llm":
         complexity.update(_child_config("classifier-model"))
+    router_config = {
+        "privacy": {"enabled": privacy_enabled},
+        "complexity": complexity,
+        "deployments": {
+            "local_fast": _child_config("local-fast", "local"),
+            "local_medium": _child_config("local-medium", "local"),
+            "cloud_complex": _child_config("cloud-complex", "cloud"),
+            "cloud_research": _child_config("cloud-research", "cloud"),
+            "cloud_reasoning": _child_config("cloud-reasoning", "cloud"),
+        },
+    }
+    if evolution is not None:
+        router_config["evolution"] = evolution
     return ModelClientConfig(
         client_provider=ProviderType.EdgeCloudRouter,
-        edge_cloud_router={
-            "privacy": {"enabled": privacy_enabled},
-            "complexity": complexity,
-            "deployments": {
-                "local_fast": _child_config("local-fast", "local"),
-                "local_medium": _child_config("local-medium", "local"),
-                "cloud_complex": _child_config("cloud-complex", "cloud"),
-                "cloud_research": _child_config("cloud-research", "cloud"),
-                "cloud_reasoning": _child_config("cloud-reasoning", "cloud"),
-            },
-        },
+        edge_cloud_router=router_config,
     )
 
 
@@ -96,6 +105,8 @@ def _client(
     privacy_enabled: bool = False,
     model_config: ModelRequestConfig | None = None,
     deployments: dict[str, FakeChild] | None = None,
+    evolution: dict | None = None,
+    judge: FakeChild | None = None,
 ) -> EdgeCloudRouterModelClient:
     try:
         import agent_xrouter  # noqa: F401
@@ -122,11 +133,42 @@ def _client(
     ]
     if mode == "llm":
         children.append(classifier or FakeChild(response=AssistantMessage(content="COMPLEX")))
+    if evolution is not None and evolution.get("enabled") and evolution.get("outcome_memory", {}).get("enabled", True):
+        children.append(judge or FakeChild(response=AssistantMessage(content="0.5")))
     with patch.object(EdgeCloudRouterModelClient, "_create_child", side_effect=children):
         return EdgeCloudRouterModelClient(
             model_config=model_config or ModelRequestConfig(model="edge-cloud-router"),
-            model_client_config=_router_config(mode=mode, privacy_enabled=privacy_enabled),
+            model_client_config=_router_config(
+                mode=mode,
+                privacy_enabled=privacy_enabled,
+                evolution=evolution,
+            ),
         )
+
+
+def _evolution_config(*, shadow: bool = True) -> dict:
+    return {
+        "enabled": True,
+        "judge": {
+            **_child_config("judge-model"),
+            "privacy_scope": "local",
+        },
+        "shadow_local_medium": shadow,
+        "routing_memory": {
+            "semantic_cache": {"enabled": False},
+        },
+        "outcome_memory": {
+            "retriever_dim": 64,
+            "max_entries": 100,
+            "top_k": 10,
+            "min_similarity": 0.5,
+        },
+    }
+
+
+async def _wait_for_outcomes(client: EdgeCloudRouterModelClient) -> None:
+    while client._outcome_tasks:
+        await asyncio.gather(*tuple(client._outcome_tasks))
 
 
 @pytest.mark.asyncio
@@ -460,6 +502,232 @@ async def test_disabled_privacy_routes_sensitive_content_by_complexity() -> None
     assert private_value in str(cloud_messages)
     assert response.metadata["edge_cloud_router"]["privacy_enabled"] is False
     assert response.metadata["edge_cloud_router"]["privacy_tier"] == "S1"
+
+
+@pytest.mark.asyncio
+async def test_evolution_local_outcome_is_scored_in_background_at_actual_tier() -> None:
+    local = FakeChild(response=AssistantMessage(content="local answer"))
+    judge = FakeChild(response=AssistantMessage(content='{"task_progress":0.8,"correctness":0.8,"grounding":0.8}'))
+    client = _client(
+        local,
+        FakeChild(),
+        mode="heuristic",
+        evolution=_evolution_config(),
+        judge=judge,
+    )
+
+    response = await client.invoke("Implement a bounded parser")
+
+    assert response.content == "local answer"
+    assert not judge.invoke_calls
+    await _wait_for_outcomes(client)
+    assert len(judge.invoke_calls) == 1
+    record = client._engine._outcome_memory._closed[0]
+    assert set(record.observations) == {client._edge.ComplexityLevel.MEDIUM}
+    assert record.observations[client._edge.ComplexityLevel.MEDIUM].cost_usd == 0.0
+    metadata = response.metadata["edge_cloud_router"]
+    assert metadata["classifier_complexity_level"] == "MEDIUM"
+    assert metadata["bandit_override"] is False
+    assert metadata["outcome_trace_id"]
+
+
+@pytest.mark.asyncio
+async def test_evolution_cloud_outcome_uses_provider_cost_and_local_medium_shadow() -> None:
+    local = FakeChild(response=AssistantMessage(content="local shadow"))
+    cloud = FakeChild(response=AssistantMessage(content="cloud answer", usage_metadata=UsageMetadata(total_cost=0.02)))
+    judge = FakeChild(response=AssistantMessage(content='{"task_progress":1,"correctness":1,"grounding":1}'))
+    client = _client(local, cloud, evolution=_evolution_config(), judge=judge)
+
+    response = await client.invoke("Analyze this entire codebase end-to-end")
+
+    assert response.content == "cloud answer"
+    assert not local.invoke_calls
+    await _wait_for_outcomes(client)
+    assert len(local.invoke_calls) == 1
+    assert len(judge.invoke_calls) == 2
+    record = client._engine._outcome_memory._closed[0]
+    assert set(record.observations) == {
+        client._edge.ComplexityLevel.MEDIUM,
+        client._edge.ComplexityLevel.COMPLEX,
+    }
+    assert record.observations[client._edge.ComplexityLevel.COMPLEX].cost_usd == 0.02
+    assert record.observations[client._edge.ComplexityLevel.MEDIUM].cost_usd == 0.0
+
+
+@pytest.mark.asyncio
+async def test_missing_cloud_cost_keeps_quality_observation_without_cost() -> None:
+    local = FakeChild(response=AssistantMessage(content="local shadow"))
+    cloud = FakeChild(response=AssistantMessage(content="cloud answer", usage_metadata=UsageMetadata()))
+    judge = FakeChild(response=AssistantMessage(content="0.6"))
+    client = _client(local, cloud, evolution=_evolution_config(), judge=judge)
+
+    await client.invoke("Analyze this entire codebase end-to-end")
+    await _wait_for_outcomes(client)
+
+    record = client._engine._outcome_memory._closed[0]
+    observation = record.observations[client._edge.ComplexityLevel.COMPLEX]
+    assert observation.score == 0.6
+    assert observation.cost_usd is None
+
+
+@pytest.mark.asyncio
+async def test_complete_stream_is_accumulated_for_background_scoring() -> None:
+    local = FakeChild(chunks=[AssistantMessageChunk(content="local "), AssistantMessageChunk(content="answer")])
+    judge = FakeChild(response=AssistantMessage(content="0.7"))
+    client = _client(
+        local,
+        FakeChild(),
+        mode="heuristic",
+        evolution=_evolution_config(),
+        judge=judge,
+    )
+
+    chunks = [chunk async for chunk in client.stream("Implement a bounded parser")]
+    await _wait_for_outcomes(client)
+
+    assert [chunk.content for chunk in chunks] == ["local ", "answer"]
+    judge_messages, _ = judge.invoke_calls[0]
+    assert "local answer" in judge_messages[1].content
+    assert client._engine._outcome_memory.stats == {"pending": 0, "closed": 1}
+
+
+@pytest.mark.asyncio
+async def test_incomplete_stream_discards_outcome_without_judge_work() -> None:
+    local = FakeChild(
+        chunks=[AssistantMessageChunk(content="partial")],
+        stream_error=RuntimeError("stream failed"),
+        error_after_chunks=True,
+    )
+    judge = FakeChild(response=AssistantMessage(content="1"))
+    client = _client(
+        local,
+        FakeChild(),
+        mode="heuristic",
+        evolution=_evolution_config(),
+        judge=judge,
+    )
+
+    with pytest.raises(RuntimeError, match="stream failed"):
+        _ = [chunk async for chunk in client.stream("Implement a bounded parser")]
+
+    assert not judge.invoke_calls
+    assert client._engine._outcome_memory.stats == {"pending": 0, "closed": 0}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stream_discards_pending_outcome() -> None:
+    local = FakeChild(chunks=[AssistantMessageChunk(content="first"), AssistantMessageChunk(content="second")])
+    judge = FakeChild(response=AssistantMessage(content="1"))
+    client = _client(
+        local,
+        FakeChild(),
+        mode="heuristic",
+        evolution=_evolution_config(),
+        judge=judge,
+    )
+
+    stream = client.stream("Implement a bounded parser")
+    assert (await anext(stream)).content == "first"
+    await stream.aclose()
+
+    assert not judge.invoke_calls
+    assert client._engine._outcome_memory.stats == {"pending": 0, "closed": 0}
+
+
+@pytest.mark.asyncio
+async def test_cloud_fallback_discards_outcome_without_judge_or_shadow() -> None:
+    local = FakeChild(response=AssistantMessage(content="fallback"))
+    cloud = FakeChild(invoke_error=RuntimeError("cloud unavailable"))
+    judge = FakeChild(response=AssistantMessage(content="1"))
+    client = _client(local, cloud, evolution=_evolution_config(), judge=judge)
+
+    response = await client.invoke("Analyze this entire codebase end-to-end")
+
+    assert response.content == "fallback"
+    assert len(local.invoke_calls) == 1
+    assert not judge.invoke_calls
+    assert client._engine._outcome_memory.stats == {"pending": 0, "closed": 0}
+
+
+@pytest.mark.asyncio
+async def test_judge_and_shadow_failures_do_not_affect_served_response() -> None:
+    judge_failure = FakeChild(invoke_error=RuntimeError("judge unavailable"))
+    local_client = _client(
+        FakeChild(response=AssistantMessage(content="served local")),
+        FakeChild(),
+        mode="heuristic",
+        evolution=_evolution_config(),
+        judge=judge_failure,
+    )
+    response = await local_client.invoke("Implement a bounded parser")
+    await _wait_for_outcomes(local_client)
+    assert response.content == "served local"
+    assert local_client._engine._outcome_memory.stats == {"pending": 0, "closed": 0}
+
+    shadow_failure = FakeChild(invoke_error=RuntimeError("shadow unavailable"))
+    cloud_client = _client(
+        shadow_failure,
+        FakeChild(response=AssistantMessage(content="served cloud")),
+        evolution=_evolution_config(),
+        judge=FakeChild(response=AssistantMessage(content="1")),
+    )
+    response = await cloud_client.invoke("Analyze this entire codebase end-to-end")
+    await _wait_for_outcomes(cloud_client)
+    assert response.content == "served cloud"
+    assert cloud_client._engine._outcome_memory.stats == {"pending": 0, "closed": 0}
+
+
+@pytest.mark.asyncio
+async def test_background_scheduling_failure_does_not_affect_served_response() -> None:
+    client = _client(
+        FakeChild(response=AssistantMessage(content="served")),
+        FakeChild(),
+        mode="heuristic",
+        evolution=_evolution_config(),
+        judge=FakeChild(response=AssistantMessage(content="1")),
+    )
+
+    with patch(
+        "openjiuwen.core.foundation.llm.model_clients.edge_cloud_router_model_client.copy.deepcopy",
+        side_effect=RuntimeError("snapshot failed"),
+    ):
+        response = await client.invoke("Implement a bounded parser")
+
+    assert response.content == "served"
+    assert client._engine._outcome_memory.stats == {"pending": 0, "closed": 0}
+
+
+def test_evolution_requires_local_judge_only_when_outcome_scoring_is_enabled() -> None:
+    missing_judge = _router_config(mode="heuristic", evolution={"enabled": True})
+    with pytest.raises(Exception, match="model service config error"):
+        _EdgeCloudRouterConfig.from_model_client_config(missing_judge)
+
+    cloud_judge = _evolution_config()
+    cloud_judge["judge"]["privacy_scope"] = "cloud"
+    with pytest.raises(Exception, match="model service config error"):
+        _EdgeCloudRouterConfig.from_model_client_config(_router_config(mode="heuristic", evolution=cloud_judge))
+
+    cache_only = _router_config(
+        mode="heuristic",
+        evolution={"enabled": True, "outcome_memory": {"enabled": False}},
+    )
+    assert _EdgeCloudRouterConfig.from_model_client_config(cache_only).evolution.judge is None
+
+
+@pytest.mark.asyncio
+async def test_disabled_evolution_creates_no_judge_memory_shadow_or_metadata() -> None:
+    local = FakeChild(response=AssistantMessage(content="answer"))
+    client = _client(local, FakeChild(), mode="heuristic")
+
+    response = await client.invoke("Implement a bounded parser")
+
+    assert client._judge_client is None
+    assert client._engine._routing_memory is None
+    assert client._engine._outcome_memory is None
+    assert not client._outcome_tasks
+    metadata = response.metadata["edge_cloud_router"]
+    assert "bandit_override" not in metadata
+    assert len(local.invoke_calls) == 1
 
 
 def test_missing_optional_package_raises_model_service_config_error() -> None:

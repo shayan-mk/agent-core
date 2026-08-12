@@ -36,11 +36,14 @@ EdgeTRL is not needed on the testing machine.
 - canonical request, policy, and result types;
 - deterministic S1/S2/S3 privacy detection and structured redaction;
 - the five-level heuristic and LLM classifier prompt/parser;
-- the fixed complexity-to-deployment decision; and
-- the privacy → classification → `RoutePlan` engine.
+- the fixed complexity-to-deployment decision;
+- the privacy → classification → `RoutePlan` engine; and
+- optional classifier caches, outcome memory, a signed judge rubric, and a
+  conservative outcome bandit.
 
 It has no agent-core, EdgeTRL, HTTP-client, GPU, or inference-engine dependency.
-There is no RL, bandit evolution, reward judge, routing memory, or training.
+The fixed router has no dependencies; the default-off evolution memory uses the
+`agent-xrouter[evolution]` NumPy extra. There is no RL, training, or weight update.
 
 ### `agent-core`
 
@@ -67,8 +70,10 @@ Privacy enforcement is configurable:
 - Local failure is never sent to cloud.
 
 The client supports normal and streaming chat. It preserves the selected answer
-provider's response and usage metadata and adds sanitized route metadata. It
-does not calculate cost, collect classifier usage, or use cost when routing.
+provider's response and usage metadata and adds sanitized route metadata. When
+evolution is enabled, it creates a seventh, separately configured local judge
+client and runs outcome scoring and `local_medium` cloud shadows in the background.
+Only provider-reported cloud cost is used; the router has no price table.
 
 ### `jiuwenswarm`
 
@@ -91,6 +96,9 @@ uv pip install --python .venv/bin/python \
   -e ../agent-core \
   -e ../agent-xrouter
 ```
+
+Install `-e '../agent-xrouter[evolution]'` instead of the last line when enabling
+outcome-memory evolution.
 
 Verify that imports resolve to the local source trees:
 
@@ -134,17 +142,19 @@ inference process. Before running the local baseline or router experiment, start
 OpenAI-compatible local endpoints yourself using **Ollama or llama.cpp**. vLLM
 is not required or used by this experiment guide.
 
-The router needs these three logical local models:
+The fixed router needs three logical local models. Evolution adds a local judge,
+which may share a physical server/model with another local client:
 
 | Purpose | Example model | Default configuration endpoint |
 |---|---|---|
 | Complexity classifier | Qwen3 0.6B | `http://127.0.0.1:8081/v1` |
 | `local_fast` answer | Gemma 3 4B | `http://127.0.0.1:8082/v1` |
 | `local_medium` answer | Qwen3 8B | `http://127.0.0.1:8083/v1` |
+| Outcome judge (evolution only) | Qwen3 4B | `http://127.0.0.1:8084/v1` |
 
-The classifier is a sixth model, separate from the five answer deployments. It
-is always configured with `privacy_scope: local`. CPU and GPU execution are
-both acceptable; the router only sees an HTTP endpoint.
+The classifier is a sixth model, separate from the five answer deployments. The
+optional judge is a seventh model client. Both use `privacy_scope: local`. CPU
+and GPU execution are acceptable; the router only sees HTTP endpoints.
 
 ### Option A: Ollama (quickest setup)
 
@@ -156,6 +166,7 @@ version and record the exact choices:
 ollama pull qwen3:0.6b
 ollama pull gemma3:4b
 ollama pull qwen3:8b
+ollama pull qwen3:4b
 ```
 
 Start the server if the desktop/service installation has not already started
@@ -180,18 +191,24 @@ export LOCAL_FAST_MODEL="gemma3:4b"
 export LOCAL_MEDIUM_API_BASE="http://127.0.0.1:11434/v1"
 export LOCAL_MEDIUM_API_KEY="EMPTY"
 export LOCAL_MEDIUM_MODEL="qwen3:8b"
+
+export OUTCOME_JUDGE_API_BASE="http://127.0.0.1:11434/v1"
+export OUTCOME_JUDGE_API_KEY="EMPTY"
+export OUTCOME_JUDGE_MODEL="qwen3:4b"
 ```
 
 Ollama's OpenAI-compatible chat endpoint supports reasoning control. The
-classifier configuration in `jiuwenswarm-router.yaml` therefore includes:
+classifier and optional outcome-judge configurations in `jiuwenswarm-router.yaml`
+therefore include:
 
 ```yaml
 reasoning_effort: none
 ```
 
-The classifier must return only one label. If the server still includes thinking
-or explanatory prose, fix the local model/template configuration before the
-experiment; invalid classifier output deliberately routes to `local_medium`.
+The classifier must return only one label, and the judge must return its compact
+score. If the server still includes thinking or explanatory prose, fix the local
+model/template configuration before the experiment; invalid classifier output
+deliberately routes to `local_medium`, while invalid judge output is discarded.
 
 Use `ollama ps` to see whether each loaded model is running on CPU, GPU, or a
 mixture. Model swapping on a memory-constrained machine can add latency, so keep
@@ -224,6 +241,14 @@ llama-server \
   --host 127.0.0.1 \
   --port 8083 \
   --ctx-size 8192
+
+# Required only when evolution is enabled; it may reuse another local server.
+llama-server \
+  --model /models/Qwen3-4B-Q4_K_M.gguf \
+  --alias Qwen/Qwen3-4B \
+  --host 127.0.0.1 \
+  --port 8084 \
+  --ctx-size 8192
 ```
 
 The file names are placeholders; set them to the downloaded GGUF files. CPU/GPU
@@ -244,6 +269,7 @@ Before starting JiuwenSwarm, check every configured base URL:
 curl -s http://127.0.0.1:8081/v1/models
 curl -s http://127.0.0.1:8082/v1/models
 curl -s http://127.0.0.1:8083/v1/models
+curl -s http://127.0.0.1:8084/v1/models  # evolution only
 ```
 
 For Ollama, use its shared endpoint instead:
@@ -341,6 +367,7 @@ Use `jiuwenswarm-router.yaml`.
 - `SIMPLE` and `MEDIUM` use the two local answer models.
 - `COMPLEX`, `RESEARCH`, and `REASONING` use their corresponding cloud models.
 - Privacy is disabled by default so this experiment measures complexity routing.
+- Outcome-memory evolution is disabled by default, preserving the fixed router.
 - To test privacy separately, set `privacy.enabled: true`; S2 is then redacted
   before classification/cloud dispatch, and S3 or detector failure uses the
   original request with `local_medium`.
@@ -350,6 +377,13 @@ Use `jiuwenswarm-router.yaml`.
 Router responses retain sanitized `edge_cloud_router` metadata containing the
 privacy-enabled flag, privacy tier, complexity result, selected deployment/model,
 and fallback reason.
+
+To evaluate evolution separately, install `agent-xrouter[evolution]`, start the local
+judge endpoint, and set `evolution.enabled: true`. Caches store the base classifier
+tier; completed outcomes can override a tier only after the configured evidence
+and utility margin are met. Scoring is background-only. Failed transport,
+fallback, incomplete streams, judge calls, or required shadow calls discard the
+pending observation without affecting the answer.
 
 ## Controlled comparison
 
@@ -379,9 +413,11 @@ Compare:
 - externally billed cloud dollar cost.
 
 Only the dollar amount reported by the cloud provider counts as experiment cost.
-Treat local model and classifier inference as zero-cost. The router preserves
-normal answer-provider usage metadata but does not calculate or aggregate cost,
-and cost never affects routing decisions.
+Treat local model, classifier, and judge inference as zero-cost. The router
+preserves normal answer-provider usage metadata and does not calculate or aggregate
+experimental cost. In the default fixed-router experiment, cost does not affect
+routing. If evolution is enabled, its utility may use the individual served cloud
+response's provider-reported `total_cost`; local and shadow cost is zero.
 
 ## Troubleshooting checklist
 

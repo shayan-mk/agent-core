@@ -2,7 +2,8 @@
 
 > One agent-core model provider routes requests by complexity across two local and three cloud deployments.
 > Optional privacy enforcement adds S2 redaction and S3 forced-local routing. Router inference is included;
-> router training and RL are not.
+> an optional outcome-memory bandit can refine decisions without changing classifier weights. Router training and
+> RL are not included.
 
 ---
 
@@ -21,8 +22,8 @@ The implementation is split across two repositories:
 
 | Owner | Responsibilities |
 |---|---|
-| `agent-xrouter` / `agent_xrouter` | Privacy detection and redaction, classifier prompt and output parsing, complexity policy, and `RoutePlan`. |
-| agent-core | Built-in provider wiring, configuration, agent-core/request conversion, classifier/local/cloud child clients, transport, streaming, fallback, response conversion, and metadata. |
+| `agent-xrouter` / `agent_xrouter` | Privacy detection and redaction, classifier prompt/parsing, complexity policy, optional caches/outcome memory/bandit, judge rubric/parsing, and `RoutePlan`. |
+| agent-core | Built-in provider wiring, configuration, request conversion, classifier/answer/judge child clients, transport, streaming, fallback, background shadow/scoring work, response conversion, and metadata. |
 
 `agent-xrouter` is an in-process Python library, not a proxy or service. It imports neither agent-core nor EdgeTRL
 and implements no model transport. It receives complexity inference through a small async callback supplied by
@@ -56,21 +57,25 @@ a plan, and leaves all transport to agent-core.
 - Non-streaming and streaming chat, tools, output parsers, provider usage fields, token IDs, and logprobs where
   supported.
 - Cloud-to-local failure fallback and sanitized route metadata.
+- A default-off evolution layer with exact/semantic classifier caches, outcome memory, and conservative
+  quality/cost-aware bandit overrides. The classifier remains frozen.
 - JiuwenSwarm activation through YAML using its normal constructed-model-client validation, without a
   router-specific runtime path.
 
 ### Out of scope
 
 - Router RL, rewards, trajectories for router training, trainers, Ray/verl changes, or model updates.
-- EdgeTRL proxy/process management, routing memory, cache, dual-track storage, or speculative local execution.
+- EdgeTRL proxy/process management, dual-track storage, speculative serving, and task/reporting services.
 - A router service, sidecar, dashboard, or dedicated router JSONL sink.
 - Image, speech, or video routing.
 - JiuwenSwarm UI authoring for the nested router configuration.
 - KV-cache affinity through the wrapper.
 - Restoring private values into cloud responses or streamed tool-call arguments.
+- GRPO buffers, LoRA/policy versions, geometric forgetting, reward training, side-turn rules, prompt-statistics
+  injection, or logprob fusion.
 
-Online bandit memory belongs in a separate `agent_xrouter.evolution` package when added. RL-based evolution may
-follow later, while the fixed inference router remains usable without training dependencies.
+Online bandit memory lives in the separate `agent_xrouter.evolution` package. RL-based evolution may follow
+later, while the fixed inference router remains usable without training dependencies.
 
 ---
 
@@ -94,12 +99,20 @@ EdgeRouterEngine                                   agent-xrouter
   4. build classifier input
   5. call injected ComplexityBackend
        timeout / error / bad output -> LOCAL
-  6. return RoutePlan
+  6. when evolution is enabled:
+       read/store the base classifier tier in routing caches
+       query similar completed outcomes
+       optionally override only with sufficient two-tier evidence and margin
+       open an opaque pending outcome record
+  7. return RoutePlan
               |
               v
 EdgeCloudRouterModelClient                         agent-core
-  7. LOCAL -> local_fast/local_medium with untouched original
+  8. LOCAL -> local_fast/local_medium with untouched original
      CLOUD -> cloud_complex/cloud_research/cloud_reasoning with safe/redacted payload
+  9. after a successful answer, optionally score it in the background
+       cloud -> score served cloud answer plus a local_medium shadow
+       local -> score the served local answer once
               |
               v
 AssistantMessage / AssistantMessageChunk
@@ -131,6 +144,11 @@ that S3 and indeterminate requests never use the configured classifier or cloud 
 must point the local child at its intended local endpoint; v1 does not try to prove where that endpoint is hosted.
 
 `invoke()` and `stream()` must share the same `_prepare_route()` path so their privacy behavior cannot diverge.
+
+Evolution is disabled by default. When disabled, no cache, memory, judge child, shadow call, or background scoring
+task is created, and the fixed router path is unchanged. When enabled, privacy still runs before every cache or
+memory operation; S3 and indeterminate requests touch none of them. The exact and semantic caches store the base
+classifier tier rather than the final bandit route, so new evidence can change a repeated request.
 
 ---
 
@@ -197,11 +215,35 @@ streamed text and tool arguments, is deferred.
 
 The adapter validates all five fixed deployments and their `local` or `cloud` privacy scope.
 
+### Optional outcome-memory evolution
+
+Evolution changes only the selected tier; it never trains or updates the classifier. It is deliberately
+conservative:
+
+- The exact cache uses SHA-256 keys with TTL/LRU bounds. The semantic cache and outcome retriever use stable,
+  local character-3-gram vectors from the optional `agent-xrouter[evolution]` NumPy extra.
+- Outcome records are opened at routing and become retrievable only after all required scores succeed. Pending
+  records expire, closed records use FIFO capacity, and optional SQLite persistence contains vectors and numeric
+  observations only—not request text.
+- The local judge returns signed task-progress, correctness, and grounding scores with weights `0.45`, `0.35`,
+  and `0.20`. Judge transport is a separately configured local agent-core child.
+- Each observation belongs to its actual five-level tier. A cloud response is stored under its selected cloud
+  tier; its counterfactual local answer is stored under `MEDIUM` (`local_medium`).
+- Utility is `mean_score - cost_weight * mean_cost / cost_reference_usd`. An override requires the configured
+  minimum relevant neighbours, evidence for the classifier tier and a challenger, and improvement greater than
+  the configured margin. A cloud tier without provider-reported cost remains quality evidence but is excluded
+  from cost-aware comparison until it has usable cost evidence.
+- `bandit.enabled: false` allows caches and outcome memory to warm without changing routes.
+
+Scoring is best-effort and does not delay the answer. Transport failure, fallback, incomplete/cancelled streams,
+judge failure, or required shadow failure discards the pending record. These failures never change the response.
+
 ---
 
 ## 5. Agent-core adapter contract
 
-Create the classifier and five answer children once when constructing the router client:
+Create the classifier and five answer children once when constructing the router client. When evolution outcome
+scoring is enabled, create one additional local judge child:
 
 ```python
 classifier_client = create_model_client(classifier.client_config, classifier.request_config)
@@ -210,6 +252,7 @@ local_medium = create_model_client(...)
 cloud_complex = create_model_client(...)
 cloud_research = create_model_client(...)
 cloud_reasoning = create_model_client(...)
+outcome_judge = create_model_client(...)  # only when enabled
 ```
 
 ### Request arguments
@@ -261,14 +304,21 @@ IDs, and logprobs. Add one sanitized namespace:
     "route_reason": "local_complexity",
     "fallback_reason": null,
     "policy_origin": "local",
-    "classifier_model": "Qwen3-0.6B"
+    "classifier_model": "Qwen3-0.6B",
+    "classifier_complexity_level": "MEDIUM",
+    "cache_source": "exact",
+    "outcome_neighbor_count": 7,
+    "bandit_override": false,
+    "outcome_trace_id": "opaque-id"
   }
 }
 ```
 
 Metadata describes the endpoint that produced the answer. A successful cloud-to-local fallback therefore reports
 the local provider/model plus a sanitized reason code. The router preserves the selected answer child's normal
-`UsageMetadata`, but does not calculate cost, collect classifier usage, or use cost in routing decisions.
+`UsageMetadata` and never maintains a model price table. With evolution disabled, cost is not a routing input.
+With evolution enabled, outcome memory can use the served cloud child's provider-reported
+`UsageMetadata.total_cost`; local and shadow answers have zero dollar cost.
 
 For streaming, add route metadata to the first emitted chunk and preserve it through aggregation. This requires:
 
@@ -284,7 +334,8 @@ Image, speech, and video methods must be concrete so the provider can be instant
 
 ### Trajectory and training behavior
 
-The router does not invoke a judge or training loop. Standard trajectories/evaluators continue to see the answer.
+The optional outcome judge supplies online memory observations only; it is not a training reward or optimizer.
+The router does not invoke a training loop. Standard trajectories/evaluators continue to see the answer.
 Cloud answers are off-policy for the local model and usually lack the token IDs/logprobs required for online PPO.
 The provider records `policy_origin` and never invents logprobs; any existing on-policy training flow must select
 local-origin samples itself.
@@ -364,6 +415,48 @@ models:
               model_request_config:
                 model: moonshotai/kimi-k2
 
+          evolution:
+            enabled: false
+            judge:
+              privacy_scope: local
+              model_client_config:
+                client_provider: OpenAI
+                api_base: ${OUTCOME_JUDGE_API_BASE}
+                api_key: ${OUTCOME_JUDGE_API_KEY:-EMPTY}
+              model_request_config:
+                model: Qwen3-4B
+                temperature: 0
+                max_tokens: 256
+                reasoning_effort: none
+            shadow_local_medium: true
+            routing_memory:
+              enabled: true
+              exact_cache:
+                enabled: true
+                ttl_seconds: 3600
+                max_entries: 10000
+                persist: false
+              semantic_cache:
+                enabled: true
+                similarity_threshold: 0.92
+                max_entries: 5000
+                s1_only: true
+            outcome_memory:
+              enabled: true
+              retriever_dim: 4096
+              max_entries: 20000
+              top_k: 10
+              min_similarity: 0.5
+              pending_ttl_seconds: 7200
+              s1_only: true
+              persist: false
+            bandit:
+              enabled: true
+              min_neighbors: 5
+              margin: 0.3
+              cost_weight: 0.1
+              cost_reference_usd: 0.01
+
       model_config_obj:
         temperature: 0.7
       is_default: true
@@ -395,6 +488,7 @@ Construction rejects:
 - a router child configured as `EdgeCloudRouter`;
 - missing classifier configuration in `llm` mode;
 - a classifier with a privacy scope other than `local`;
+- enabled outcome scoring without a separately configured `local` judge;
 - a missing fixed deployment or deployment model name;
 - a `local_*` deployment without `privacy_scope: local` or a `cloud_*` deployment without
   `privacy_scope: cloud`; and
@@ -419,14 +513,15 @@ agent-xrouter/                                  separate repository/distribution
 │   ├── request.py                           validation and immutable copies
 │   ├── privacy.py                           detection and structured redaction
 │   ├── complexity.py                        prompt, parser, ComplexityBackend
-│   ├── policy.py                            pure routing decision
-│   └── evolution/                           optional bandit memory (added separately)
+│   ├── policy.py                            pure fixed routing decision
+│   └── evolution/                           optional cache, outcome memory, judge rubric, bandit
 └── tests/
     ├── test_engine.py
     ├── test_request.py
     ├── test_privacy.py
     ├── test_complexity.py
-    └── test_policy.py
+    ├── test_policy.py
+    └── test_evolution.py
 
 agent-core/
 ├── openjiuwen/core/foundation/llm/
@@ -451,10 +546,11 @@ jiuwenswarm/
 └── tests/unit_tests/agentserver/               focused compatibility test
 ```
 
-`agent-xrouter` exports only `EdgeRouterEngine`, `ComplexityBackend`, canonical request/config types, and typed
-results. Internal patterns and helpers remain private. Agent-core requires a compatible installed package and
-must not contain a second policy implementation. The agent-core adapter intentionally stays in one provider file,
-matching the existing `*_model_client.py` layout; the reusable policy remains modular in `agent-xrouter`.
+`agent-xrouter` exports the engine and backend protocols, canonical request/config/result types, and evolution
+policy types. Cache, memory, judge, and bandit implementations remain grouped under `agent_xrouter.evolution`.
+Agent-core requires a compatible installed package and must not contain a second policy implementation. The
+agent-core adapter intentionally stays in one provider file, matching the existing `*_model_client.py` layout;
+the reusable policy remains modular in `agent-xrouter`.
 
 ---
 
@@ -465,10 +561,10 @@ EdgeTRL is a source and test reference, not a runtime dependency.
 | Disposition | Land in | What |
 |---|---|---|
 | Direct port | `agent-xrouter` | `ComplexityLevel`; five labels; PII/credential/high-risk patterns; tool/path lists; placeholder format; useful fixtures and decision cases. |
-| Adapt | `agent-xrouter` | `PrivacyDetector.check()`, traversal, tool inspection, rule engine, redaction, classifier prompt/parser, bounded preview, and `Router._make_decision()`. |
-| Reimplement | `agent-xrouter` | Portable request/result/config types, `EdgeRouterEngine`, `ComplexityBackend`, conservative normalization, and safe error/logging behavior. |
-| Reimplement | agent-core | `EdgeCloudRouterModelClient`, nested config, conversions, classifier backend, child construction, invoke/stream fallback, argument/header isolation, response metadata, and aggregation fixes. |
-| Do not port | neither | `CloudClient`, proxy/OPD, routing memory, dual-track context, side turns, heuristic failure escalation, cache/training fields, trainers, rewards, and dashboards. |
+| Adapt | `agent-xrouter` | `PrivacyDetector.check()`, traversal, tool inspection, rule engine, redaction, classifier prompt/parser, bounded preview, routing caches, hashed retriever, two-phase outcome memory, signed judge rubric/parser, and outcome bandit. |
+| Reimplement | `agent-xrouter` | Portable request/result/config types, `EdgeRouterEngine`, backend protocols, five-tier observations, conservative normalization, and safe error/logging behavior. |
+| Reimplement | agent-core | `EdgeCloudRouterModelClient`, nested config, conversions, classifier/judge backends, child construction, background scoring/shadow inference, invoke/stream fallback, argument/header isolation, response metadata, and aggregation fixes. |
+| Do not port | neither | `CloudClient`, proxy/OPD, dual-track context, side turns, heuristic failure escalation, policy/LoRA versions, GRPO/training fields, trainers, reporting services, and dashboards. |
 
 Important adaptations:
 
@@ -478,6 +574,9 @@ Important adaptations:
 - Parse classifier output with a strict full match instead of searching arbitrary prose.
 - Replace `BLOCK` with a local S3 plan.
 - Parse/redact/reserialize tool argument JSON; never copy EdgeTRL's raw string replacement.
+- Cache the base classifier tier rather than the final route, and run privacy before cache/memory access.
+- Store cloud and `local_medium` shadow observations under their actual five-level tiers.
+- Persist only vectors and numeric outcomes; do not retain retrieval text after vectorization.
 
 ---
 
@@ -495,6 +594,9 @@ Important adaptations:
 - Concurrent requests do not share redaction state.
 - Local plans contain no payload; cloud plans contain only the safe/redacted payload.
 - Logs/results contain no raw PII, credentials, reverse map, prompts, or exception text.
+- Evolution-disabled behavior creates no cache, memory, judge, shadow, or scoring work.
+- Cache TTL/capacity/persistence, two-phase outcome lifecycle, concurrent query snapshots, conservative override
+  gates, missing cloud-cost handling, and absence of persisted raw retrieval text are covered.
 
 ### Agent-core and integration
 
@@ -508,7 +610,9 @@ Important adaptations:
   provider-agnostic.
 - Each complexity level reaches its fixed deployment. With privacy enabled, S2 reaches cloud only redacted and
   S3 reaches `local_medium` only.
-- No router trainer, reward judge, proxy, sidecar, Ray actor, or EdgeTRL process starts.
+- Optional scoring uses a separate local judge, provider cost, and `local_medium` shadow without delaying or
+  changing the served answer; failed/incomplete work is discarded.
+- No router trainer, training reward, proxy, sidecar, Ray actor, or EdgeTRL process starts.
 
 ---
 
@@ -517,9 +621,8 @@ Important adaptations:
 - Stateful restoration of S2 values in cloud responses/tool calls.
 - Session-aware cloud context after an earlier S3 message.
 - KV-cache release/affinity through nested providers.
-- Routing caches, budgets, and cost policies.
+- Budget-aware routing beyond the configured outcome utility.
 - JiuwenSwarm UI authoring.
-- Online bandit and outcome-memory evolution (`agent_xrouter.evolution`).
 - RL-based router evolution and training.
 - An optional small local privacy model; v1 privacy detection remains rule-based.
 - An optional `agent-xrouter` inference launcher/service for local models. V1 instead consumes operator-managed

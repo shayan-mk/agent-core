@@ -92,6 +92,55 @@ models:
               model_request_config:
                 model: ${CLOUD_REASONING_MODEL:-moonshotai/kimi-k2-thinking}
 
+          # Default-off online memory and bandit evolution. Enabling this block
+          # requires agent-xrouter[evolution] and a local judge endpoint.
+          evolution:
+            enabled: false
+            judge:
+              privacy_scope: local
+              model_client_config:
+                client_provider: OpenAI
+                api_base: ${OUTCOME_JUDGE_API_BASE:-http://127.0.0.1:8084/v1}
+                api_key: ${OUTCOME_JUDGE_API_KEY:-EMPTY}
+                timeout: 30
+                verify_ssl: false
+              model_request_config:
+                model: ${OUTCOME_JUDGE_MODEL:-Qwen/Qwen3-4B}
+                temperature: 0
+                max_tokens: 256
+                reasoning_effort: none
+            shadow_local_medium: true
+
+            routing_memory:
+              enabled: true
+              exact_cache:
+                enabled: true
+                ttl_seconds: 3600
+                max_entries: 10000
+                persist: false
+              semantic_cache:
+                enabled: true
+                similarity_threshold: 0.92
+                max_entries: 5000
+                s1_only: true
+
+            outcome_memory:
+              enabled: true
+              retriever_dim: 4096
+              max_entries: 20000
+              top_k: 10
+              min_similarity: 0.5
+              pending_ttl_seconds: 7200
+              s1_only: true
+              persist: false
+
+            bandit:
+              enabled: true
+              min_neighbors: 5
+              margin: 0.3
+              cost_weight: 0.1
+              cost_reference_usd: 0.01
+
       # Explicit router-level sampling values override each selected child's
       # defaults and keep the baseline/router comparison repeatable.
       model_config_obj:
